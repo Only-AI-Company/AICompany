@@ -264,9 +264,22 @@ export class ToolExecutor {
   }
 }
 
-// 工厂函数
+// 工厂函数 - 每次创建新实例，支持不同配置
 let instance: ToolExecutor | null = null;
 
+/**
+ * 创建 ToolExecutor 实例
+ * @param options 配置选项
+ * @returns 新的 ToolExecutor 实例
+ */
+export function createToolExecutor(options?: ExecutorOptions): ToolExecutor {
+  return new ToolExecutor(options);
+}
+
+/**
+ * 获取单例 ToolExecutor 实例（不推荐，建议使用 createToolExecutor）
+ * @deprecated 使用 createToolExecutor 代替
+ */
 export function getToolExecutor(options?: ExecutorOptions): ToolExecutor {
   if (!instance) {
     instance = new ToolExecutor(options);

@@ -1,0 +1,34 @@
+{
+  "name": "ai-company-v2",
+  "version": "2.0.0",
+  "description": "AI Company - 从零开始的简化实现",
+  "type": "module",
+  "main": "dist/cli/index.js",
+  "bin": {
+    "ai-company": "dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli/index.js",
+    "db:init": "node dist/cli/index.js db:init",
+    "db:reset": "node dist/cli/index.js db:reset"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "commander": "^12.1.0",
+    "eventemitter3": "^5.0.1",
+    "node-telegram-bot-api": "^0.66.0",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/node": "^20.11.30",
+    "@types/node-telegram-bot-api": "^0.64.3",
+    "@types/node-cron": "^3.0.11",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

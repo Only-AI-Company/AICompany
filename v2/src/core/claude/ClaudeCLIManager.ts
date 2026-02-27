@@ -32,7 +32,6 @@ export interface FileOperation {
  */
 export class ClaudeCLIManager {
   private workspacePath: string;
-  private claudeProcess: any = null;
   private isInitialized = false;
 
   constructor(workspacePath: string) {
@@ -106,7 +105,11 @@ export class ClaudeCLIManager {
 
       // Timeout handling
       setTimeout(() => {
-        process.kill();
+        try {
+          process.kill();
+        } catch {
+          // 进程可能已结束，忽略异常
+        }
         resolve({
           success: false,
           error: 'Command timeout',
@@ -270,13 +273,25 @@ export class ClaudeCLIManager {
   }
 }
 
-// 工厂函数
-let managerInstance: ClaudeCLIManager | null = null;
+// 多例管理 - 按工作区路径存储实例
+const managerInstances = new Map<string, ClaudeCLIManager>();
 
+/**
+ * 获取或创建 ClaudeCLIManager 实例
+ * @param workspacePath 工作区路径，不传则使用默认路径
+ * @returns ClaudeCLIManager 实例
+ */
 export function getClaudeCLIManager(workspacePath?: string): ClaudeCLIManager {
-  if (!managerInstance || workspacePath) {
-    const path = workspacePath || process.cwd() + '/.workspace';
-    managerInstance = new ClaudeCLIManager(path);
+  const path = workspacePath || process.cwd() + '/.workspace';
+  if (!managerInstances.has(path)) {
+    managerInstances.set(path, new ClaudeCLIManager(path));
   }
-  return managerInstance;
+  return managerInstances.get(path)!;
+}
+
+/**
+ * 清理所有实例
+ */
+export function cleanupCLIManagers(): void {
+  managerInstances.clear();
 }

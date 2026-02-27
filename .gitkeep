@@ -1,0 +1,30 @@
+# AI Company - Git 保留文件
+
+# 技术方案文档
+.dev/技术方案/
+
+# 状态数据库
+state.db
+
+# JD 库
+.jds/
+
+# 产出目录
+outputs/
+
+# 日志
+*.log
+
+# 临时文件
+tmp/
+temp/
+
+# TypeScript
+tsconfig.json
+
+# 项目文档
+README.md
+LICENSE
+
+# Claude 配置
+.claude/

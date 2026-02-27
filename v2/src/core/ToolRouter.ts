@@ -92,8 +92,13 @@ export class ToolRouter {
     }
 
     // 开放性任务 - 创建应用/网站/工具等
-    if (this.matchesAny(normalizedInput, ['创建', '新建', 'make', 'create', 'add', '添加', '弄', '搞', '开发', 'build', 'generate'])) {
-      if (this.matchesAny(normalizedInput, ['应用', 'app', '网站', 'web', '网页', '工具', 'tool', '程序', 'program', '页面', 'page'])) {
+    // 第一组：动作关键词（创建、开发、写等）
+    const actionKeywords = ['创建', '新建', 'make', 'create', 'add', '添加', '弄', '搞', '开发', 'build', 'generate', '写', '做一个', '做一个'];
+    // 第二组：目标对象关键词（应用、网站、工具等）
+    const targetKeywords = ['应用', 'app', '网站', 'web', '网页', '工具', 'tool', '程序', 'program', '页面', 'page', '系统', '功能', '计算器', '游戏'];
+
+    if (this.matchesAny(normalizedInput, actionKeywords)) {
+      if (this.matchesAny(normalizedInput, targetKeywords)) {
         return {
           intent: { type: 'open_task', confidence: CONFIDENCE_HIGH, entities: { description: this.extractTaskDescription(input) } },
           toolCalls: [{ tool: 'execute_open_task', params: { description: this.extractTaskDescription(input) } }],

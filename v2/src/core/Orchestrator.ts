@@ -15,7 +15,7 @@ import { getExecutionEngine } from './Execute.js';
 import { getCronScheduler } from './CronScheduler.js';
 import { getEmployeeService } from './Employee.js';
 import { getTaskPlanner } from './TaskPlanner.js';
-import { getToolExecutor } from './ToolExecutor.js';
+import { createToolExecutor } from './ToolExecutor.js';
 import { getValidator } from './Validator.js';
 import { getWorkspaceManager } from './Workspace.js';
 
@@ -328,7 +328,7 @@ export class Orchestrator {
 
       // 2. 执行任务
       const workspaceManager = getWorkspaceManager();
-      const toolExecutor = getToolExecutor({
+      const toolExecutor = createToolExecutor({
         workspaceManager,
         onProgress: (progress) => {
           console.log(`[Orchestrator] Progress: ${progress.currentStep}/${progress.totalSteps} - ${progress.currentStepName}`);

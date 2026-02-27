@@ -21,6 +21,7 @@ export interface ValidationResult {
 
 export interface ValidationOptions {
   cliManager?: ClaudeCLIManager;
+  completionThreshold?: number;  // 完成率阈值，默认 80%
 }
 
 /**
@@ -30,9 +31,11 @@ export interface ValidationOptions {
  */
 export class Validator {
   private cliManager?: ClaudeCLIManager;
+  private readonly completionThreshold: number;  // 完成率阈值（0-100）
 
   constructor(options?: ValidationOptions) {
     this.cliManager = options?.cliManager;
+    this.completionThreshold = options?.completionThreshold ?? 80;
   }
 
   /**
@@ -48,9 +51,14 @@ export class Validator {
     const errors: string[] = [];
     const warnings: string[] = [];
 
+    // 验证 workspacePath 有效性
+    if (!this.cliManager && !workspacePath) {
+      throw new Error('Validator requires either a CLIManager or workspacePath');
+    }
+
     // 使用传入的或现有的 CLI Manager
     const cliManager =
-      this.cliManager || new ClaudeCLIManager(workspacePath || '');
+      this.cliManager || new ClaudeCLIManager(workspacePath!);
 
     // 1. 检查所有步骤是否执行成功
     const failedSteps = executionResult.results.filter((r) => !r.success);
@@ -125,11 +133,11 @@ export class Validator {
 
     checks.push({
       name: '完成率检查',
-      passed: completionRate >= 80,
+      passed: completionRate >= this.completionThreshold,
       message: `${completionRate.toFixed(1)}% 步骤完成`,
     });
 
-    if (completionRate < 80) {
+    if (completionRate < this.completionThreshold) {
       errors.push(`完成率过低：${completionRate.toFixed(1)}%`);
     } else if (completionRate < 100) {
       warnings.push(`部分步骤未完成：${completionRate.toFixed(1)}%`);

@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Company - 一个人拥有一家公司战斗力</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #0b0f1a;
+        --bg-soft: #121829;
+        --text: #e6ecff;
+        --muted: #9aa7c7;
+        --accent: #7c5cff;
+        --accent-2: #29d3c0;
+        --accent-3: #ff8bd3;
+        --card: #151c2f;
+        --border: rgba(255, 255, 255, 0.08);
+        --shadow: 0 20px 60px rgba(10, 12, 24, 0.45);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
+        background: radial-gradient(1200px 800px at 20% -10%, rgba(124, 92, 255, 0.35), transparent 60%),
+          radial-gradient(900px 600px at 90% 0%, rgba(41, 211, 192, 0.25), transparent 55%),
+          radial-gradient(900px 700px at 70% 80%, rgba(255, 139, 211, 0.18), transparent 60%),
+          var(--bg);
+        color: var(--text);
+        line-height: 1.6;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+      .container {
+        width: min(1120px, 92%);
+        margin: 0 auto;
+      }
+      header {
+        padding: 28px 0 40px;
+      }
+      nav {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+      .logo {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+      }
+      .logo-badge {
+        width: 36px;
+        height: 36px;
+        border-radius: 12px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        display: grid;
+        place-items: center;
+        font-weight: 800;
+        color: #0b0f1a;
+      }
+      .nav-links {
+        display: flex;
+        gap: 18px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .hero {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 48px;
+        align-items: center;
+        padding: 32px 0 60px;
+      }
+      .hero h1 {
+        font-size: clamp(32px, 4vw, 52px);
+        margin: 0 0 16px;
+      }
+      .hero p {
+        margin: 0 0 24px;
+        color: var(--muted);
+        font-size: 18px;
+      }
+      .cta {
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+      }
+      .button {
+        padding: 12px 20px;
+        border-radius: 999px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        color: #0b0f1a;
+        font-weight: 700;
+        box-shadow: var(--shadow);
+      }
+      .button.secondary {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--text);
+      }
+      .hero-card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        padding: 24px;
+        border-radius: 20px;
+        box-shadow: var(--shadow);
+      }
+      .hero-metrics {
+        margin-top: 18px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 12px;
+      }
+      .hero-metric {
+        padding: 12px 14px;
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid var(--border);
+      }
+      .hero-metric span {
+        display: block;
+        font-weight: 700;
+        font-size: 18px;
+      }
+      .hero-card h3 {
+        margin: 0 0 12px;
+      }
+      .hero-card ul {
+        padding-left: 18px;
+        margin: 0;
+        color: var(--muted);
+      }
+      section {
+        padding: 56px 0;
+      }
+      h2 {
+        font-size: clamp(24px, 3vw, 36px);
+        margin: 0 0 16px;
+      }
+      .subtitle {
+        color: var(--muted);
+        max-width: 720px;
+      }
+      .grid {
+        margin-top: 28px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 20px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        padding: 22px;
+        border-radius: 18px;
+        min-height: 160px;
+      }
+      .card h4 {
+        margin: 0 0 10px;
+      }
+      .card p {
+        margin: 0;
+        color: var(--muted);
+      }
+      .timeline {
+        display: grid;
+        gap: 18px;
+      }
+      .step {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px dashed var(--border);
+        padding: 18px;
+        border-radius: 16px;
+      }
+      .kpis {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 18px;
+        margin-top: 24px;
+      }
+      .kpi {
+        background: var(--card);
+        border: 1px solid var(--border);
+        padding: 18px;
+        border-radius: 16px;
+        text-align: center;
+      }
+      .kpi span {
+        font-size: 28px;
+        font-weight: 700;
+        display: block;
+        margin-bottom: 8px;
+      }
+      .faq {
+        display: grid;
+        gap: 14px;
+      }
+      .faq-item {
+        padding: 16px 18px;
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid var(--border);
+      }
+      footer {
+        padding: 40px 0 60px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: rgba(124, 92, 255, 0.2);
+        color: #d8d0ff;
+        font-size: 13px;
+      }
+      .pill-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 16px;
+      }
+      .pill {
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--border);
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .split {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 24px;
+        align-items: center;
+      }
+      .panel {
+        background: linear-gradient(145deg, rgba(124, 92, 255, 0.12), rgba(41, 211, 192, 0.08));
+        border: 1px solid var(--border);
+        padding: 24px;
+        border-radius: 20px;
+      }
+      .panel.dark {
+        background: var(--card);
+      }
+      .list {
+        display: grid;
+        gap: 12px;
+        margin: 0;
+        padding-left: 18px;
+        color: var(--muted);
+      }
+      .strip {
+        margin-top: 18px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 14px;
+      }
+      .strip-item {
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--border);
+      }
+      .tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: rgba(124, 92, 255, 0.2);
+        color: #d8d0ff;
+        font-size: 12px;
+      }
+      .comparison {
+        margin-top: 24px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 16px;
+      }
+      .comparison-card {
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 20px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+      .comparison-card h4 {
+        margin: 0 0 10px;
+      }
+      .terminal {
+        font-family: "SFMono-Regular", "Menlo", monospace;
+        background: #0a1022;
+        border: 1px solid rgba(124, 92, 255, 0.3);
+        padding: 18px;
+        border-radius: 14px;
+        color: #d6dcf7;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+      .stack-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 14px;
+        margin-top: 20px;
+      }
+      .stack-item {
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--border);
+      }
+      .cta-banner {
+        background: linear-gradient(135deg, rgba(124, 92, 255, 0.25), rgba(41, 211, 192, 0.2));
+        border: 1px solid rgba(124, 92, 255, 0.4);
+        padding: 28px;
+        border-radius: 22px;
+        display: grid;
+        gap: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="container">
+        <nav>
+          <div class="logo">
+            <div class="logo-badge">AI</div>
+            <span>AI Company</span>
+          </div>
+          <div class="nav-links">
+            <a href="#value">价值</a>
+            <a href="#capabilities">能力</a>
+            <a href="#muscle">细节</a>
+            <a href="#workflow">流程</a>
+            <a href="#stack">系统栈</a>
+            <a href="#cases">场景</a>
+            <a href="#faq">FAQ</a>
+          </div>
+        </nav>
+
+        <div class="hero">
+          <div>
+            <div class="badge">一人一公司 · 战斗力倍增</div>
+            <h1>AI Company 让你拥有一家公司的战斗力</h1>
+            <p>
+              它不是一个普通助手，而是一个可执行、可协作、可治理的“公司系统”。
+              通过任务、员工、技能、流程与记忆的协同，让个人具备跨职能组织的执行力。
+            </p>
+            <div class="cta">
+              <a class="button" href="#contact">预约演示</a>
+              <a class="button secondary" href="#capabilities">查看能力</a>
+            </div>
+            <div class="hero-metrics">
+              <div class="hero-metric">
+                <span>全流程闭环</span>
+                需求→交付→复盘
+              </div>
+              <div class="hero-metric">
+                <span>多角色协作</span>
+                规划 / 执行 / 审核
+              </div>
+              <div class="hero-metric">
+                <span>成果可追溯</span>
+                输出 / 质量 / 记忆
+              </div>
+            </div>
+          </div>
+          <div class="hero-card">
+            <h3>你得到的是一家公司</h3>
+            <ul>
+              <li>能拆解目标并调度执行</li>
+              <li>能持续复盘并优化质量</li>
+              <li>能沉淀知识与复用产出</li>
+              <li>能组织多角色并行作战</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <section id="value">
+      <div class="container">
+        <h2>不是“更聪明的助手”，而是“可运营的组织”</h2>
+        <p class="subtitle">
+          AI Company 把复杂工作变成可执行的组织流程，从“需求”到“交付”全链路闭环，让个人具备团队级别的产出与节奏。
+        </p>
+        <div class="kpis">
+          <div class="kpi">
+            <span>端到端</span>
+            需求→执行→复盘
+          </div>
+          <div class="kpi">
+            <span>多角色</span>
+            规划 / 执行 / 审核
+          </div>
+          <div class="kpi">
+            <span>可治理</span>
+            任务、质量与产出归档
+          </div>
+          <div class="kpi">
+            <span>可复用</span>
+            记忆、技能与模板沉淀
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="capabilities">
+      <div class="container">
+        <h2>核心能力</h2>
+        <p class="subtitle">围绕“公司运作”构建的模块化能力栈，覆盖执行、调度、评估与知识沉淀。</p>
+        <div class="grid">
+          <div class="card">
+            <h4>任务引擎</h4>
+            <p>从需求解析到任务拆解、状态管理、执行结果回写，形成可追踪的交付流。</p>
+          </div>
+          <div class="card">
+            <h4>员工体系</h4>
+            <p>角色化员工与技能栈，支持分配、协作、绩效统计与持续成长。</p>
+          </div>
+          <div class="card">
+            <h4>技能与工具</h4>
+            <p>内置与可扩展技能库，让员工拥有可复用的“企业能力”。</p>
+          </div>
+          <div class="card">
+            <h4>质量审核</h4>
+            <p>自动评审产出质量，形成反馈闭环，保证交付稳定性。</p>
+          </div>
+          <div class="card">
+            <h4>多入口协作</h4>
+            <p>CLI、Webhook、Telegram 等入口统一到任务系统，快速触发执行。</p>
+          </div>
+          <div class="card">
+            <h4>记忆与复盘</h4>
+            <p>沉淀执行过程、输出与知识，为后续任务提供上下文复用。</p>
+          </div>
+        </div>
+
+        <div class="pill-list">
+          <div class="pill">任务调度</div>
+          <div class="pill">员工管理</div>
+          <div class="pill">技能管理</div>
+          <div class="pill">质量评分</div>
+          <div class="pill">产出归档</div>
+          <div class="pill">自动复盘</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="muscle">
+      <div class="container">
+        <h2>细节肌肉：把复杂工作做成可控系统</h2>
+        <p class="subtitle">
+          从组织视角设计的执行引擎，既能推进、也能复盘，还能沉淀为可复用的能力资产。
+        </p>
+        <div class="split">
+          <div class="panel">
+            <div class="tag">组织级执行</div>
+            <h3>任务生命周期可视化</h3>
+            <ul class="list">
+              <li>输入需求即生成任务档案与执行路径</li>
+              <li>自动写入状态、产出、错误与质量</li>
+              <li>输出产物归档，随时拉取交付结果</li>
+              <li>错误回写与修复建议形成闭环</li>
+            </ul>
+          </div>
+          <div class="panel dark">
+            <div class="terminal">
+              📋 创建任务 → 指派员工 → 执行 → 复盘<br />
+              ▸ status: executing / auditing / completed<br />
+              ▸ output: deliverable.md / report.txt<br />
+              ▸ quality: 0-100 / feedback / fixes<br />
+              ▸ memory: knowledge &amp; patterns
+            </div>
+          </div>
+        </div>
+        <div class="strip">
+          <div class="strip-item">
+            <strong>任务引擎</strong>
+            <div class="subtitle">状态、产出、复盘三位一体</div>
+          </div>
+          <div class="strip-item">
+            <strong>员工体系</strong>
+            <div class="subtitle">角色化、技能化、可成长</div>
+          </div>
+          <div class="strip-item">
+            <strong>技能资产</strong>
+            <div class="subtitle">沉淀为可复用的企业能力</div>
+          </div>
+          <div class="strip-item">
+            <strong>质量治理</strong>
+            <div class="subtitle">评审与反馈自动化</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="workflow">
+      <div class="container">
+        <h2>从第一性原理看工作流</h2>
+        <p class="subtitle">
+          目标是把工作拆成“可执行的组织流程”，每一步都有责任主体、工具与质量反馈。
+        </p>
+        <div class="timeline">
+          <div class="step">
+            <strong>1. 需求输入</strong>
+            <div>通过命令或接口提交需求，系统建立任务记录。</div>
+          </div>
+          <div class="step">
+            <strong>2. 任务拆解与分配</strong>
+            <div>分析任务复杂度并匹配合适的员工与技能。</div>
+          </div>
+          <div class="step">
+            <strong>3. 执行与产出</strong>
+            <div>员工调用工具执行，产出沉淀为可追踪的交付物。</div>
+          </div>
+          <div class="step">
+            <strong>4. 质量审核</strong>
+            <div>Reviewer 自动评审，给出评分与改进建议。</div>
+          </div>
+          <div class="step">
+            <strong>5. 记忆沉淀</strong>
+            <div>经验与知识回流到系统，形成下一次执行的优势。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="stack">
+      <div class="container">
+        <h2>系统栈：可扩展的企业能力框架</h2>
+        <p class="subtitle">面向持续迭代与扩展设计，既能单人运转，也能支撑团队级运营。</p>
+        <div class="stack-grid">
+          <div class="stack-item">
+            <strong>任务与调度</strong>
+            <div class="subtitle">Scheduler / Queue / Orchestrator</div>
+          </div>
+          <div class="stack-item">
+            <strong>执行与工具</strong>
+            <div class="subtitle">Skills / Tools / Integrations</div>
+          </div>
+          <div class="stack-item">
+            <strong>员工与绩效</strong>
+            <div class="subtitle">Roles / Growth / Scorecard</div>
+          </div>
+          <div class="stack-item">
+            <strong>质量与复盘</strong>
+            <div class="subtitle">Reviewer / Feedback Loop</div>
+          </div>
+          <div class="stack-item">
+            <strong>记忆与知识</strong>
+            <div class="subtitle">Memory / Knowledge Base</div>
+          </div>
+          <div class="stack-item">
+            <strong>入口与协作</strong>
+            <div class="subtitle">CLI / Web / Telegram / API</div>
+          </div>
+        </div>
+        <div class="comparison">
+          <div class="comparison-card">
+            <h4>AI 助手</h4>
+            <ul class="list">
+              <li>单点对话输出</li>
+              <li>缺少流程与治理</li>
+              <li>难以复用与规模化</li>
+            </ul>
+          </div>
+          <div class="comparison-card">
+            <h4>AI Company</h4>
+            <ul class="list">
+              <li>组织化执行系统</li>
+              <li>任务 / 角色 / 质量闭环</li>
+              <li>可扩展、可沉淀、可运营</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="container">
+        <h2>适用场景</h2>
+        <div class="grid">
+          <div class="card">
+            <h4>创业者</h4>
+            <p>一个人同时推进产品、研发、市场与运营，具备“公司级别”执行力。</p>
+          </div>
+          <div class="card">
+            <h4>团队管理者</h4>
+            <p>把团队流程标准化，降低管理成本，提升交付可控性。</p>
+          </div>
+          <div class="card">
+            <h4>自动化工程</h4>
+            <p>将复杂流程变为标准化的任务流，持续运行与优化。</p>
+          </div>
+          <div class="card">
+            <h4>咨询与交付</h4>
+            <p>复用模板与最佳实践，快速形成高质量交付。</p>
+          </div>
+          <div class="card">
+            <h4>产品迭代</h4>
+            <p>研发、测试、发布与复盘形成一条持续迭代流水线。</p>
+          </div>
+          <div class="card">
+            <h4>运营增长</h4>
+            <p>内容、投放、数据分析跨职能协同，持续优化增长飞轮。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="faq">
+      <div class="container">
+        <h2>常见问题</h2>
+        <div class="faq">
+          <div class="faq-item">
+            <strong>AI Company 和普通 AI 助手有什么差别？</strong>
+            <div>它是“组织系统”，而不是单点回答，重点在执行、协作与治理。</div>
+          </div>
+          <div class="faq-item">
+            <strong>可以扩展自己的能力吗？</strong>
+            <div>可以，技能与工具模块可以按业务需求持续扩展。</div>
+          </div>
+          <div class="faq-item">
+            <strong>输出如何确保质量？</strong>
+            <div>内置 Reviewer 对产出进行评估并反馈，形成闭环。</div>
+          </div>
+          <div class="faq-item">
+            <strong>适合哪些规模使用？</strong>
+            <div>从个人到小团队都可用，核心价值是让执行系统化。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="contact">
+      <div class="container">
+        <div class="cta-banner">
+          <h2>准备开始拥有一家公司的战斗力？</h2>
+          <p class="subtitle">
+            让 AI Company 成为你的执行组织，快速落地你的战略与计划。
+          </p>
+          <div class="cta">
+            <a class="button" href="#">立即咨询</a>
+            <a class="button secondary" href="#value">了解更多</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div class="container">
+        <div>AI Company · 一个人也能拥有一家公司战斗力</div>
+      </div>
+    </footer>
+  </body>
+</html>
