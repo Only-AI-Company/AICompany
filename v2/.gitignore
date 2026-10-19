@@ -1,0 +1,63 @@
+# 编译生成的文件
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.pyc
+*.so
+
+# 系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.cache
+
+# 环境变量文件
+.env
+.env.local
+.env.*.local
+
+# 依赖目录
+node_modules/
+vendor/
+
+# 构建输出
+dist/
+build/
+out/
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# 浏览器状态（登录状态等）
+.browser-state/
+
+# 浏览器截图
+screenshot-*.png

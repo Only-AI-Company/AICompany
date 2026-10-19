@@ -1,0 +1,15 @@
+/**
+ * Capabilities - 系统能力扩展目录
+ *
+ * 当 Employee (Claude CLI) 需要新功能时，会在这里编写代码。
+ *
+ * 能力格式：
+ * - 导出函数或类
+ * - 提供清晰的接口
+ * - 包含必要的错误处理
+ *
+ * 示例：
+ * export async function myCapability(params: any): Promise<Result> {
+ *   // 实现
+ * }
+ */

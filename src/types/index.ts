@@ -697,14 +697,14 @@ export interface GenerationOptions {
 
 // ============================================================================
 // Tool System 相关类型（从 core/tools/types.ts 重新导出）
-// ============================================================================
-
-// Re-export key types from the tool system
-export type {
-  ToolCategory,
-  ToolContext,
-  ToolResult,
-  Tool,
-  ToolStats,
-  IntentAnalysisResult,
-} from '../core/tools/types.js';
+// // ============================================================================
+// 
+// // Re-export key types from the tool system
+// export type {
+//   ToolCategory,
+//   ToolContext,
+//   ToolResult,
+//   Tool,
+//   ToolStats,
+//   IntentAnalysisResult,
+// } from '../core/tools/types.js';

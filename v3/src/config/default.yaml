@@ -1,0 +1,91 @@
+# AI Company v3 - Default Configuration
+
+engine:
+  loop_interval: 1000          # 主循环间隔 (ms)
+  review_interval: 60000       # 复盘间隔 (ms)
+  max_concurrent_tasks: 3      # 最大并发任务数
+  max_task_attempts: 3         # 任务最大重试次数
+  graceful_shutdown_timeout: 30000  # 优雅关闭超时 (ms)
+
+ai:
+  default_provider: anthropic
+  model: claude-3-5-sonnet-20241022
+  temperature: 0.7
+  max_tokens: 4096
+
+  providers:
+    anthropic:
+      api_key: ${ANTHROPIC_API_KEY}
+      base_url: https://api.anthropic.com
+      priority: 1
+
+    qwen:
+      api_key: ${QWEN_API_KEY}
+      base_url: https://dashscope.aliyuncs.com
+      model: qwen-max
+      priority: 2
+
+    zhipu:
+      api_key: ${ZHIPU_API_KEY}
+      base_url: https://open.bigmodel.cn
+      model: glm-4
+      priority: 3
+
+database:
+  path: ./data/company.db
+  backup_enabled: true
+  backup_interval: 86400      # 每天备份 (秒)
+  backup_retention: 7         # 保留7天
+
+logging:
+  level: info                 # debug, info, warn, error
+  format: pretty              # pretty, json
+  file:
+    enabled: true
+    path: ./logs/ai-company.log
+    max_size: 100M
+    max_files: 10
+  console:
+    enabled: true
+    colorize: true
+
+employees:
+  default_level: 1
+  default_performance: 50
+  default_satisfaction: 70
+
+  presets:
+    - name: "Writer"
+      role: "写作专家"
+      skills: ["写作", "编辑", "文案"]
+      system_prompt: "你是一位专业的写作者，擅长创作各种类型的文章和文案。"
+
+    - name: "Developer"
+      role: "开发工程师"
+      skills: ["编程", "代码审查", "架构设计"]
+      system_prompt: "你是一位资深的软件工程师，擅长编写高质量代码。"
+
+    - name: "Analyst"
+      role: "分析师"
+      skills: ["分析", "研究", "报告"]
+      system_prompt: "你是一位专业的分析师，擅长数据分析和市场研究。"
+
+    - name: "Designer"
+      role: "设计师"
+      skills: ["设计", "UI", "UX"]
+      system_prompt: "你是一位专业的UI/UX设计师。"
+
+tools:
+  enabled:
+    - bash
+    - file_read
+    - file_write
+    - search
+
+  bash:
+    timeout: 30000
+    allowed_commands: ["ls", "cd", "cat", "grep", "find", "head", "tail"]
+
+  file:
+    base_path: ./workspace
+    max_size: 10M

@@ -8,27 +8,45 @@
     "ai-company": "dist/cli/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp schema.sql dist/",
     "dev": "tsc --watch",
     "start": "node dist/cli/index.js",
+    "server": "node dist/cli/index.js server",
     "db:init": "node dist/cli/index.js db:init",
-    "db:reset": "node dist/cli/index.js db:reset"
+    "db:reset": "node dist/cli/index.js db:reset",
+    "test": "npm run build && node dist/test-mvp-flows.js",
+    "test:integration": "npm run build && node dist/test-integration.js"
   },
   "dependencies": {
     "better-sqlite3": "^9.4.3",
     "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
     "eventemitter3": "^5.0.1",
+    "glob": "^13.0.6",
+    "inquirer": "^9.2.0",
+    "node-cron": "^3.0.3",
+    "node-pty": "^1.0.0",
     "node-telegram-bot-api": "^0.66.0",
-    "node-cron": "^3.0.3"
+    "uuid": "^10.0.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.10",
+    "@types/inquirer": "^9.0.0",
     "@types/node": "^20.11.30",
-    "@types/node-telegram-bot-api": "^0.64.3",
     "@types/node-cron": "^3.0.11",
+    "@types/node-telegram-bot-api": "^0.64.3",
+    "@types/uuid": "^10.0.0",
     "typescript": "^5.3.3"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "types": "./dist/cli/index.d.ts"
 }

@@ -132,6 +132,37 @@ cat tests/TEST_REPORT.md
 | **消息** | 点对点消息系统 |
 | **审计** | 文件审计日志 |
 
+---
+
+## 实验 (Experiments)
+
+从第一性原理出发，通过具体场景逐步演化架构。
+
+### 小红书自动化运营
+
+AI 内容生成 + 自动发布的完整工作流。
+
+```bash
+cd experiments/xiaohongshu
+
+# 首次登录
+npm run setup
+
+# 自动发布
+npm run publish "春季穿搭搭配"
+
+# 查看历史
+npm run history
+```
+
+**功能：**
+- ✅ AI 生成小红书文案
+- ✅ 自动发布到小红书
+- ✅ 数据库存储历史记录
+- ✅ Cookies 会话管理
+
+**快速开始：** 查看 [experiments/xiaohongshu/README.md](experiments/xiaohongshu/README.md)
+
 ## 许可证
 
 [MIT](LICENSE)

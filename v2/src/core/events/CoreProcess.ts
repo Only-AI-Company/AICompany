@@ -1,0 +1,2477 @@
+/**
+ * AI Company v2 - 核心处理流程
+ *
+ * 职责：协调用户输入到任务执行的流程
+ *
+ * 核心流程：
+ * 1. 监听用户输入事件 (user.input)
+ * 2. 通过 CEO 分析意图 (query 或 execute)
+ * 3. 根据 type 分发到相应处理器
+ * 4. 处理 PTY 劫持的决策请求
+ *
+ * 注意：任务复盘由 TaskReviewer 负责，不在此处理
+ */
+
+import { getEventBus, type SystemEvent, type UserInputEvent } from './EventBus.js';
+import { getAgentFactory } from '../agents/AgentFactory.js';
+import { DynamicAgent } from '../agents/DynamicAgent.js';
+import { getDatabase } from '../../db/Database.js';
+import { getCEOSupervisor, type AnalysisResult } from '../supervision/CEOSupervisorAgent.js';
+import { getConfigManager } from '../../config/ConfigManager.js';
+import { getToolRegistry } from '../tools/ToolRegistry.js';
+import { getTaskSessionManager } from '../execution/TaskSessionManager.js';
+import { getTaskReviewer } from './TaskReviewer.js';
+// CXO 架构
+import type { Intent, CEOAnalysisResult, CXORole } from '../cxo/types.js';
+import type { ExecutionResult, TaskRequirements } from '../cxo/types.js';
+
+/**
+ * 核心处理流程
+ */
+export class CoreProcess {
+  private eventBus = getEventBus();
+  private db = getDatabase();
+  private ceo = getCEOSupervisor();
+  private configManager = getConfigManager();
+  private toolRegistry = getToolRegistry();
+  private taskReviewer = getTaskReviewer(); // 任务复盘器
+  // 当前活跃的 Agent - 使用 LRU 缓存机制，定期清理不活跃的 Agent
+  private activeAgents = new Map<string, DynamicAgent>();
+  private agentLastUsed = new Map<string, number>(); // 记录每个 Agent 最后使用时间
+  private agentUseCount = new Map<string, number>(); // 记录每个 Agent 使用次数（用于 LRU）
+  private cleanupTimer?: NodeJS.Timeout;
+  private memoryCheckTimer?: NodeJS.Timeout;
+  private readonly AGENT_IDLE_TIMEOUT = 3600000; // 1 小时（可配置）
+  private readonly CLEANUP_INTERVAL = 600000; // 10 分钟（可配置）
+  private readonly MAX_AGENTS = 50; // 最大 Agent 数量限制（防止内存溢出）
+  private readonly MEMORY_CHECK_INTERVAL = 300000; // 5 分钟检查一次内存使用
+  private agentAccessOrder: string[] = []; // LRU 访问顺序
+
+  // 防止重复创建 Agent 的锁
+  private pendingAgentCreations?: Set<string>;
+
+  // 失败任务队列（用于自动恢复）
+  private failedTaskQueue: Map<string, {
+    taskId: string;
+    description: string;
+    requiredCapabilities: string[];
+    employeeId?: string;
+    inputEvent: UserInputEvent;
+    error: Error;
+    attemptCount: number;
+    lastAttempt: number;
+    nextRetryTime: number;
+    isRetryable: boolean;
+    addedTime: number; // 添加到队列的时间
+  }> = new Map();
+  private retryTimer?: NodeJS.Timeout;
+  private readonly RETRY_CHECK_INTERVAL = 60000; // 每分钟检查一次失败任务队列
+  private readonly MAX_RETRY_ATTEMPTS = 5; // 最大重试次数
+  private readonly MAX_RETRY_DELAY = 3600000; // 最大重试延迟 1 小时
+  private readonly MAX_FAILED_QUEUE_SIZE = 1000; // 失败任务队列最大大小
+  private readonly TASK_EXPIRY_TIME = 7 * 24 * 3600000; // 7 天任务过期时间
+
+  // 决策超时相关
+  private readonly DECISION_TIMEOUT = 30000; // 30 秒决策超时
+  private pendingDecisions = new Map<string, {
+    decisionId: string;
+    taskId: string;
+    description: string;
+    requestTime: number;
+  }>();
+  private readonly MAX_PENDING_DECISIONS = 100; // 最大待处理决策数量
+
+  constructor() {
+    // 订阅决策事件，处理 PTY 劫持的决策请求
+    this.subscribeToDecisionEvents();
+  }
+
+  /**
+   * 订阅决策事件（PTY 劫持响应）
+   */
+  private subscribeToDecisionEvents(): void {
+    this.eventBus.on('decision.requested' as any, async (event: any) => {
+      console.log(`\n[CoreProcess] 🎯 收到决策请求: ${event.decisionId}`);
+
+      // 检查待处理决策数量
+      if (this.pendingDecisions.size >= this.MAX_PENDING_DECISIONS) {
+        console.error('[CoreProcess] ❌ 待处理决策队列已满，拒绝新决策请求');
+        this.eventBus.emit({
+          type: 'decision.made' as any,
+          decisionId: event.decisionId,
+          taskId: event.taskId,
+          decision: {
+            selectedOption: 'no',
+            reasoning: '系统过载，自动拒绝',
+          },
+          timestamp: Date.now(),
+        });
+        return;
+      }
+
+      // 记录待处理决策
+      const requestTime = Date.now();
+      this.pendingDecisions.set(event.decisionId, {
+        decisionId: event.decisionId,
+        taskId: event.taskId,
+        description: event.description || '需要确认操作',
+        requestTime,
+      });
+
+      try {
+        // 使用 Promise.race 添加超时保护
+        const decision = await Promise.race([
+          this.ceo.makeDecision({
+            decisionId: event.decisionId,
+            taskId: event.taskId,
+            type: 'user_confirmation',
+            description: event.description || '需要确认操作',
+            options: [
+              { value: 'yes', label: '是/继续', risk: 'low' },
+              { value: 'no', label: '否/跳过', risk: 'low' },
+            ],
+          }),
+          this.createDecisionTimeoutPromise(event.decisionId, event.description),
+        ]);
+
+        console.log(`[CoreProcess] ✅ CEO 决策: ${decision.selectedOption}`);
+
+        // 发出决策完成事件（TaskSession 会监听并注入到 PTY）
+        this.eventBus.emit({
+          type: 'decision.made' as any,
+          decisionId: event.decisionId,
+          taskId: event.taskId,
+          decision,
+          timestamp: Date.now(),
+        });
+      } catch (error: any) {
+        // 超时或其他错误
+        console.error(`[CoreProcess] ❌ 决策失败: ${error.message}`);
+
+        // 记录决策超时/失败
+        this.db.logActivity({
+          eventType: 'decision.failed',
+          actor: 'core_process',
+          action: 'decision_timeout_or_error',
+          context: {
+            decisionId: event.decisionId,
+            taskId: event.taskId,
+            description: event.description,
+            error: error.message,
+          },
+        });
+
+        // 使用保守的 Fallback 决策
+        this.eventBus.emit({
+          type: 'decision.made' as any,
+          decisionId: event.decisionId,
+          taskId: event.taskId,
+          decision: {
+            selectedOption: 'no',
+            reasoning: `决策超时或失败: ${error.message}，使用保守 Fallback`,
+          },
+          timestamp: Date.now(),
+        });
+      } finally {
+        // 清理待处理决策
+        this.pendingDecisions.delete(event.decisionId);
+      }
+    });
+  }
+
+  /**
+   * 创建决策超时 Promise
+   */
+  private createDecisionTimeoutPromise(decisionId: string, description?: string): Promise<never> {
+    return new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`决策超时 (${this.DECISION_TIMEOUT}ms): ${description || decisionId}`));
+      }, this.DECISION_TIMEOUT);
+    });
+  }
+
+  /**
+   * 清理过期的待处理决策
+   */
+  private cleanupStaleDecisions(): void {
+    const now = Date.now();
+    const staleThreshold = now - this.DECISION_TIMEOUT * 2; // 2倍超时时间
+
+    for (const [decisionId, info] of this.pendingDecisions.entries()) {
+      if (info.requestTime < staleThreshold) {
+        console.warn(`[CoreProcess] 清理过期决策: ${decisionId}`);
+        this.pendingDecisions.delete(decisionId);
+      }
+    }
+  }
+
+  /**
+   * 启动核心流程
+   */
+  start(): void {
+    console.log('[CoreProcess] Starting core process...');
+
+    // 订阅各类事件
+    this.subscribeToEvents();
+
+    // 启动任务复盘器（关键：启动记忆系统）
+    this.taskReviewer.start();
+
+    // 启动定期清理任务
+    this.startCleanupTimer();
+
+    // 启动失败任务重试定时器
+    this.startRetryTimer();
+
+    console.log('[CoreProcess] Core process started');
+  }
+
+  /**
+   * 停止核心流程，清理资源
+   */
+  stop(): void {
+    console.log('[CoreProcess] Stopping core process...');
+
+    // 停止清理定时器
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = undefined;
+    }
+
+    // 停止内存监控定时器
+    if (this.memoryCheckTimer) {
+      clearInterval(this.memoryCheckTimer);
+      this.memoryCheckTimer = undefined;
+    }
+
+    // 停止重试定时器
+    if (this.retryTimer) {
+      clearInterval(this.retryTimer);
+      this.retryTimer = undefined;
+    }
+
+    // 清理所有 Agent 引用（但不删除数据库中的员工）
+    this.activeAgents.clear();
+    this.agentLastUsed.clear();
+    this.agentUseCount.clear();
+    this.agentAccessOrder = [];
+
+    console.log('[CoreProcess] Core process stopped');
+  }
+
+  /**
+   * 启动定期清理任务
+   */
+  private startCleanupTimer(): void {
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupInactiveAgents();
+    }, this.CLEANUP_INTERVAL);
+
+    // 启动内存监控定时器
+    this.memoryCheckTimer = setInterval(() => {
+      this.checkMemoryPressure();
+    }, this.MEMORY_CHECK_INTERVAL);
+  }
+
+  /**
+   * 启动失败任务重试定时器
+   */
+  private startRetryTimer(): void {
+    this.retryTimer = setInterval(() => {
+      this.processFailedTaskQueue();
+    }, this.RETRY_CHECK_INTERVAL);
+
+    console.log(`[CoreProcess] 失败任务重试定时器已启动 (间隔: ${this.RETRY_CHECK_INTERVAL}ms)`);
+  }
+
+  /**
+   * 处理失败任务队列
+   */
+  private processFailedTaskQueue(): void {
+    const now = Date.now();
+    const retryableTasks: string[] = [];
+
+    // 找出所有可以重试的任务
+    for (const [taskId, taskInfo] of this.failedTaskQueue.entries()) {
+      if (now >= taskInfo.nextRetryTime && taskInfo.isRetryable) {
+        retryableTasks.push(taskId);
+      }
+    }
+
+    if (retryableTasks.length === 0) {
+      return;
+    }
+
+    console.log(`[CoreProcess] 🔄 发现 ${retryableTasks.length} 个可重试的失败任务`);
+
+    // 依次重试任务
+    for (const taskId of retryableTasks) {
+      const taskInfo = this.failedTaskQueue.get(taskId);
+      if (!taskInfo) continue;
+
+      // 检查重试次数
+      if (taskInfo.attemptCount >= this.MAX_RETRY_ATTEMPTS) {
+        console.warn(`[CoreProcess] ❌ 任务 ${taskId} 已达到最大重试次数 (${this.MAX_RETRY_ATTEMPTS})，放弃重试`);
+        this.failedTaskQueue.delete(taskId);
+
+        // 记录最终失败
+        this.db.logActivity({
+          eventType: 'task.final_failure',
+          actor: 'core_process',
+          action: 'max_retries_exceeded',
+          context: {
+            taskId,
+            description: taskInfo.description.substring(0, 100),
+            attemptCount: taskInfo.attemptCount,
+            finalError: taskInfo.error?.message,
+          },
+        });
+
+        continue;
+      }
+
+      // 计算新的重试延迟（指数退避）
+      const delay = Math.min(
+        30000 * Math.pow(2, taskInfo.attemptCount), // 初始 30 秒，每次翻倍
+        this.MAX_RETRY_DELAY
+      );
+
+      // 从队列中移除（将在 processTaskWithRetry 中重新添加）
+      this.failedTaskQueue.delete(taskId);
+
+      // 更新重试计数
+      taskInfo.attemptCount++;
+      taskInfo.lastAttempt = now;
+      taskInfo.nextRetryTime = now + delay;
+
+      console.log(`[CoreProcess] 🔄 重试任务 ${taskId} (尝试 ${taskInfo.attemptCount}/${this.MAX_RETRY_ATTEMPTS})`);
+
+      // 记录重试活动
+      this.db.logActivity({
+        eventType: 'task.retry',
+        actor: 'core_process',
+        action: 'retry_from_queue',
+        context: {
+          taskId,
+          attemptCount: taskInfo.attemptCount,
+          delay,
+          previousError: taskInfo.error?.message,
+        },
+      });
+
+      // 重新执行任务（带重试机制）
+      this.processTaskWithRetry(
+        taskInfo.taskId,
+        taskInfo.description,
+        taskInfo.requiredCapabilities,
+        taskInfo.employeeId || '',
+        taskInfo.inputEvent
+      ).catch((error) => {
+        // 如果重试失败，processTaskWithRetry 会重新加入队列
+        console.error(`[CoreProcess] 重试任务 ${taskId} 失败: ${error.message}`);
+      });
+    }
+  }
+
+  /**
+   * 添加任务到失败队列
+   */
+  private addToFailedQueue(
+    taskId: string,
+    description: string,
+    requiredCapabilities: string[],
+    employeeId: string,
+    inputEvent: UserInputEvent,
+    error: Error
+  ): void {
+    // 判断是否可重试
+    const isRetryable = this.shouldRetryTask(error, 1);
+
+    // 如果不可重试，不添加到队列
+    if (!isRetryable) {
+      console.log(`[CoreProcess] 📋 任务 ${taskId} 不可重试，不添加到队列`);
+      return;
+    }
+
+    // 检查队列大小限制
+    if (this.failedTaskQueue.size >= this.MAX_FAILED_QUEUE_SIZE) {
+      console.warn(`[CoreProcess] ⚠️  失败任务队列已满 (${this.MAX_FAILED_QUEUE_SIZE})，清理过期任务`);
+
+      // 清理过期任务
+      this.cleanupExpiredTasks();
+
+      // 如果清理后仍然满，移除最老的任务
+      if (this.failedTaskQueue.size >= this.MAX_FAILED_QUEUE_SIZE) {
+        const oldestTask = Array.from(this.failedTaskQueue.entries())
+          .sort((a, b) => a[1].addedTime - b[1].addedTime)[0];
+        if (oldestTask) {
+          this.failedTaskQueue.delete(oldestTask[0]);
+          console.warn(`[CoreProcess] 移除最老的任务: ${oldestTask[0]}`);
+        }
+      }
+    }
+
+    // 计算初始重试延迟（30 秒）
+    const initialDelay = 30000;
+
+    const taskInfo = {
+      taskId,
+      description,
+      requiredCapabilities,
+      employeeId,
+      inputEvent,
+      error,
+      attemptCount: 1,
+      lastAttempt: Date.now(),
+      nextRetryTime: Date.now() + initialDelay,
+      isRetryable,
+      addedTime: Date.now(),
+    };
+
+    this.failedTaskQueue.set(taskId, taskInfo);
+
+    console.log(`[CoreProcess] 📋 任务 ${taskId} 已添加到失败队列 (队列大小: ${this.failedTaskQueue.size}/${this.MAX_FAILED_QUEUE_SIZE})`);
+
+    // 记录到活动日志
+    this.db.logActivity({
+      eventType: 'task.failed_queued',
+      actor: 'core_process',
+      action: 'add_to_failed_queue',
+      context: {
+        taskId,
+        description: description.substring(0, 100),
+        isRetryable,
+        nextRetryTime: taskInfo.nextRetryTime,
+        queueSize: this.failedTaskQueue.size,
+        error: error.message,
+      },
+    });
+  }
+
+  /**
+   * 清理过期的失败任务
+   */
+  private cleanupExpiredTasks(): void {
+    const now = Date.now();
+    const expiryThreshold = now - this.TASK_EXPIRY_TIME;
+    let cleaned = 0;
+
+    for (const [taskId, taskInfo] of this.failedTaskQueue.entries()) {
+      // 移除超过过期时间的任务
+      if (taskInfo.addedTime < expiryThreshold) {
+        this.failedTaskQueue.delete(taskId);
+        cleaned++;
+        console.log(`[CoreProcess] 清理过期任务: ${taskId} (添加时间: ${new Date(taskInfo.addedTime).toISOString()})`);
+      }
+
+      // 移除达到最大重试次数且上次重试时间过久的任务
+      if (taskInfo.attemptCount >= this.MAX_RETRY_ATTEMPTS) {
+        const timeSinceLastAttempt = now - taskInfo.lastAttempt;
+        if (timeSinceLastAttempt > this.TASK_EXPIRY_TIME) {
+          this.failedTaskQueue.delete(taskId);
+          cleaned++;
+          console.log(`[CoreProcess] 清理已达到重试上限的过期任务: ${taskId}`);
+        }
+      }
+    }
+
+    if (cleaned > 0) {
+      console.log(`[CoreProcess] 清理了 ${cleaned} 个过期任务`);
+    }
+  }
+
+  /**
+   * 获取失败任务队列统计信息
+   */
+  getFailedTaskStats(): {
+    total: number;
+    retryable: number;
+    nonRetryable: number;
+    tasks: Array<{
+      taskId: string;
+      description: string;
+      attemptCount: number;
+      isRetryable: boolean;
+      nextRetryTime?: number;
+    }>;
+  } {
+    const stats = {
+      total: this.failedTaskQueue.size,
+      retryable: 0,
+      nonRetryable: 0,
+      tasks: [] as Array<{
+        taskId: string;
+        description: string;
+        attemptCount: number;
+        isRetryable: boolean;
+        nextRetryTime?: number;
+      }>,
+    };
+
+    for (const [taskId, taskInfo] of this.failedTaskQueue.entries()) {
+      if (taskInfo.isRetryable) {
+        stats.retryable++;
+      } else {
+        stats.nonRetryable++;
+      }
+
+      stats.tasks.push({
+        taskId,
+        description: taskInfo.description.substring(0, 50),
+        attemptCount: taskInfo.attemptCount,
+        isRetryable: taskInfo.isRetryable,
+        nextRetryTime: taskInfo.nextRetryTime,
+      });
+    }
+
+    return stats;
+  }
+
+  /**
+   * 清理不活跃的 Agent（改进版：LRU + 数量限制 + 内存压力）
+   */
+  private cleanupInactiveAgents(): void {
+    const now = Date.now();
+    const before = this.activeAgents.size;
+    let cleaned = 0;
+
+    // 1. 检查是否超过最大 Agent 数量限制
+    if (this.activeAgents.size > this.MAX_AGENTS) {
+      const excessCount = this.activeAgents.size - this.MAX_AGENTS;
+      console.warn(`[CoreProcess] Agent 数量 (${this.activeAgents.size}) 超过限制 (${this.MAX_AGENTS})，清理 ${excessCount} 个最少使用的 Agent`);
+
+      // 按 LRU 顺序清理最少使用的 Agent
+      for (let i = 0; i < excessCount && this.agentAccessOrder.length > 0; i++) {
+        const lruAgentId = this.agentAccessOrder.shift()!;
+        const agent = this.activeAgents.get(lruAgentId);
+        if (agent) {
+          const status = agent.getStatus();
+          // 只清理 idle 的 Agent
+          if (status.state === 'idle') {
+            this.activeAgents.delete(lruAgentId);
+            this.agentLastUsed.delete(lruAgentId);
+            this.agentUseCount.delete(lruAgentId);
+            cleaned++;
+          } else {
+            // 如果 Agent 正在忙碌，把它放到队列末尾
+            this.agentAccessOrder.push(lruAgentId);
+          }
+        }
+      }
+
+      if (cleaned > 0) {
+        console.log(`[CoreProcess] 数量限制清理：清理了 ${cleaned} 个 Agent`);
+      }
+    }
+
+    // 2. 清理超时的 idle Agent
+    for (const [id, agent] of this.activeAgents.entries()) {
+      const lastUsed = this.agentLastUsed.get(id) || 0;
+      const idleTime = now - lastUsed;
+
+      // 清理超过闲置阈值的 idle Agent
+      if (idleTime > this.AGENT_IDLE_TIMEOUT) {
+        const status = agent.getStatus();
+        if (status.state === 'idle') {
+          this.activeAgents.delete(id);
+          this.agentLastUsed.delete(id);
+          this.agentUseCount.delete(id);
+          // 从访问顺序中移除
+          const idx = this.agentAccessOrder.indexOf(id);
+          if (idx !== -1) {
+            this.agentAccessOrder.splice(idx, 1);
+          }
+          cleaned++;
+          console.log(`[CoreProcess] 清理不活跃 Agent: ${agent.name} (闲置 ${Math.round(idleTime / 1000)}秒)`);
+        }
+      }
+    }
+
+    const after = this.activeAgents.size;
+    if (before !== after || cleaned > 0) {
+      console.log(`[CoreProcess] Agent 清理：${before} → ${after} (清理 ${cleaned} 个)`);
+    }
+  }
+
+  /**
+   * 检查内存压力，必要时进行激进清理
+   */
+  private checkMemoryPressure(): void {
+    const memUsage = process.memoryUsage();
+    const totalMem = memUsage.heapTotal;
+    const usedMem = memUsage.heapUsed;
+    const memRatio = usedMem / totalMem;
+
+    // 内存使用率超过 80%，触发激进清理
+    if (memRatio > 0.8) {
+      console.warn(`[CoreProcess] ⚠️  内存压力高: ${(memRatio * 100).toFixed(1)}% (${Math.round(usedMem / 1024 / 1024)}MB / ${Math.round(totalMem / 1024 / 1024)}MB)`);
+
+      // 激进清理：清理所有 idle Agent
+      const before = this.activeAgents.size;
+      let cleaned = 0;
+
+      for (const [id, agent] of this.activeAgents.entries()) {
+        const status = agent.getStatus();
+        if (status.state === 'idle') {
+          this.activeAgents.delete(id);
+          this.agentLastUsed.delete(id);
+          this.agentUseCount.delete(id);
+          // 从访问顺序中移除
+          const idx = this.agentAccessOrder.indexOf(id);
+          if (idx !== -1) {
+            this.agentAccessOrder.splice(idx, 1);
+          }
+          cleaned++;
+        }
+      }
+
+      // 触发 GC（如果可用）
+      if (global.gc) {
+        console.log('[CoreProcess] 触发垃圾回收');
+        global.gc();
+      }
+
+      console.log(`[CoreProcess] 内存压力清理：${before} → ${this.activeAgents.size} (清理 ${cleaned} 个 Agent)`);
+    }
+  }
+
+  /**
+   * 记录 Agent 访问（用于 LRU）
+   */
+  private recordAgentAccess(agentId: string): void {
+    // 更新最后使用时间
+    this.agentLastUsed.set(agentId, Date.now());
+
+    // 更新使用计数
+    const count = (this.agentUseCount.get(agentId) || 0) + 1;
+    this.agentUseCount.set(agentId, count);
+
+    // 更新 LRU 访问顺序
+    const idx = this.agentAccessOrder.indexOf(agentId);
+    if (idx !== -1) {
+      this.agentAccessOrder.splice(idx, 1);
+    }
+    this.agentAccessOrder.push(agentId);
+  }
+
+  /**
+   * 获取或创建 Agent（带缓存）
+   * 使用原子操作避免竞态条件
+   */
+  private getOrCreateAgent(employeeId: string, definition: any): DynamicAgent {
+    // 原子操作：如果已存在，直接返回
+    const existingAgent = this.activeAgents.get(employeeId);
+    if (existingAgent) {
+      this.recordAgentAccess(employeeId);
+      return existingAgent;
+    }
+
+    // 检查是否正在创建中（避免重复创建）
+    if (this.pendingAgentCreations?.has(employeeId)) {
+      // 等待其他调用完成创建
+      const maxWait = 5000; // 最多等5秒
+      const start = Date.now();
+      while (this.pendingAgentCreations.has(employeeId) && Date.now() - start < maxWait) {
+        // 简单的忙等待（实际应该用 Promise/async）
+        // 由于这是同步方法，只能这样处理
+      }
+      // 再次检查缓存
+      const agent = this.activeAgents.get(employeeId);
+      if (agent) {
+        this.recordAgentAccess(employeeId);
+        return agent;
+      }
+    }
+
+    // 标记正在创建
+    if (!this.pendingAgentCreations) {
+      this.pendingAgentCreations = new Set<string>();
+    }
+    this.pendingAgentCreations.add(employeeId);
+
+    try {
+      // 双重检查：可能在等待期间已被其他调用创建
+      const doubleCheck = this.activeAgents.get(employeeId);
+      if (doubleCheck) {
+        this.recordAgentAccess(employeeId);
+        return doubleCheck;
+      }
+
+      // 检查 Agent 数量限制（创建前检查）
+      if (this.activeAgents.size >= this.MAX_AGENTS) {
+        console.warn(`[CoreProcess] ⚠️  Agent 数量已达上限 (${this.MAX_AGENTS})，尝试清理空闲 Agent`);
+
+        // 尝试清理空闲 Agent
+        const freed = this.cleanupIdleAgentsSync();
+        if (!freed && this.activeAgents.size >= this.MAX_AGENTS) {
+          const error = `Agent 数量已达上限 (${this.MAX_AGENTS})，无法创建新 Agent。请等待现有任务完成或增加系统资源。`;
+          console.error(`[CoreProcess] ❌ ${error}`);
+
+          // 记录错误并抛出异常
+          this.db.logActivity({
+            eventType: 'agent.limit_reached',
+            actor: 'core_process',
+            action: 'agent_creation_failed',
+            context: {
+              employeeId,
+              currentCount: this.activeAgents.size,
+              maxAgents: this.MAX_AGENTS,
+            },
+          });
+
+          throw new Error(error);
+        }
+      }
+
+      // 创建新 Agent
+      const agent = new DynamicAgent(definition);
+      this.activeAgents.set(employeeId, agent);
+      this.recordAgentAccess(employeeId);
+
+      console.log(`[CoreProcess] 创建新 Agent: ${agent.name} (${employeeId}), 总数: ${this.activeAgents.size}/${this.MAX_AGENTS}`);
+
+      // 初始化 Agent
+      agent.initialize();
+
+      return agent;
+    } finally {
+      // 清理创建标记
+      this.pendingAgentCreations?.delete(employeeId);
+    }
+  }
+
+  /**
+   * 同步清理空闲 Agent（用于创建 Agent 前的紧急清理）
+   * @returns 是否成功释放了至少一个 Agent
+   */
+  private cleanupIdleAgentsSync(): boolean {
+    const now = Date.now();
+    let cleaned = 0;
+
+    // 只清理 idle 的 Agent
+    for (const [id, agent] of this.activeAgents.entries()) {
+      const status = agent.getStatus();
+      if (status.state === 'idle') {
+        const lastUsed = this.agentLastUsed.get(id) || 0;
+        const idleTime = now - lastUsed;
+
+        // 清理闲置超过 1 分钟的 Agent
+        if (idleTime > 60000) {
+          this.activeAgents.delete(id);
+          this.agentLastUsed.delete(id);
+          this.agentUseCount.delete(id);
+          // 从访问顺序中移除
+          const idx = this.agentAccessOrder.indexOf(id);
+          if (idx !== -1) {
+            this.agentAccessOrder.splice(idx, 1);
+          }
+          cleaned++;
+          console.log(`[CoreProcess] 紧急清理空闲 Agent: ${agent.name} (闲置 ${Math.round(idleTime / 1000)}秒)`);
+        }
+      }
+    }
+
+    if (cleaned > 0) {
+      console.log(`[CoreProcess] 紧急清理了 ${cleaned} 个 Agent`);
+    }
+
+    return cleaned > 0;
+  }
+
+  /**
+   * 获取清理统计信息
+   */
+  getCleanupStats(): {
+    totalAgents: number;
+    activeAgents: number;
+    idleAgents: number;
+    avgIdleTime: number;
+    memoryUsage: NodeJS.MemoryUsage;
+    maxAgents: number;
+  } {
+    const now = Date.now();
+    let idleCount = 0;
+    let totalIdleTime = 0;
+
+    for (const [id, agent] of this.activeAgents.entries()) {
+      const status = agent.getStatus();
+      const lastUsed = this.agentLastUsed.get(id) || 0;
+      const idleTime = now - lastUsed;
+
+      if (status.state === 'idle') {
+        idleCount++;
+        totalIdleTime += idleTime;
+      }
+    }
+
+    return {
+      totalAgents: this.activeAgents.size,
+      activeAgents: this.activeAgents.size - idleCount,
+      idleAgents: idleCount,
+      avgIdleTime: idleCount > 0 ? totalIdleTime / idleCount : 0,
+      memoryUsage: process.memoryUsage(),
+      maxAgents: this.MAX_AGENTS,
+    };
+  }
+
+  /**
+   * 获取 Agent 统计信息（供 SystemMonitor 使用）
+   */
+  getAgentStats(): {
+    total: number;
+    active: number;
+    idle: number;
+    avgIdleTime: number;
+    maxAgents: number;
+    failedTaskQueueSize: number;
+  } {
+    const stats = this.getCleanupStats();
+    const failedStats = this.getFailedTaskStats();
+
+    return {
+      total: stats.totalAgents,
+      active: stats.activeAgents,
+      idle: stats.idleAgents,
+      avgIdleTime: stats.avgIdleTime,
+      maxAgents: stats.maxAgents,
+      failedTaskQueueSize: failedStats.total,
+    };
+  }
+
+  /**
+   * 订阅所有需要处理的事件
+   */
+  private subscribeToEvents(): void {
+    // 用户输入 → CEO 分析 → query 或 execute
+    this.eventBus.on('user.input', this.handleUserInput.bind(this));
+
+    // 时间触发事件（Cron 任务完成等）
+    this.eventBus.on('time.triggered' as any, this.handleTimeTriggered.bind(this));
+  }
+
+  /**
+   * 处理时间触发事件
+   *
+   * 当 Cron 任务完成时触发，用于处理相关的结果和通知
+   */
+  private async handleTimeTriggered(event: any): Promise<void> {
+    console.log(`\n[CoreProcess] ⏰ 时间触发事件: ${event.triggerType}`);
+
+    try {
+      if (event.triggerType === 'cron') {
+        await this.handleCronCompletion(event.data);
+      } else if (event.triggerType === 'overdue') {
+        await this.handleOverdueTask(event.data);
+      } else if (event.triggerType === 'scheduled') {
+        await this.handleScheduledTask(event.data);
+      } else {
+        console.warn(`[CoreProcess] 未知的时间触发类型: ${event.triggerType}`);
+      }
+    } catch (error: any) {
+      console.error(`[CoreProcess] 处理时间触发事件失败: ${error.message}`);
+    }
+  }
+
+  /**
+   * 处理 Cron 任务完成
+   */
+  private async handleCronCompletion(data: {
+    cronJob?: any;
+    executionId?: string;
+    output?: string;
+    duration?: number;
+  }): Promise<void> {
+    const { cronJob, executionId, output, duration } = data;
+    if (!cronJob) {
+      console.warn('[CoreProcess] Cron 事件缺少 cronJob 数据');
+      return;
+    }
+
+    console.log(`[CoreProcess] Cron 任务完成: ${cronJob.name} (${duration}ms)`);
+    // 记录活动日志
+    this.db.logActivity({
+      eventType: 'cron.completed',
+      actor: 'cron_system',
+      action: 'cron_job_executed',
+      context: {
+        cronJobId: cronJob.id,
+        cronJobName: cronJob.name,
+        executionId,
+        duration,
+      },
+      result: {
+        success: true,
+        output: output?.substring(0, 500),
+      },
+    });
+
+    // 检查是否有关联的 Goal，如果需要则更新 Goal 状态
+    if (cronJob.goal_id) {
+      try {
+        const goal = this.db.getGoal(cronJob.goal_id);
+        if (goal && goal.status === 'active') {
+          // 检查 Goal 是否应该完成（这里简化处理，实际可能需要更复杂的逻辑）
+          // 对于 Cron 任务，我们通常只是记录执行，不自动完成 Goal
+          console.log(`[CoreProcess] Cron 任务 ${cronJob.name} 关联到 Goal ${cronJob.goal_id}`);
+        }
+      } catch (e) {
+        console.warn(`[CoreProcess] 检查关联 Goal 失败:`, e);
+      }
+    }
+
+    // 如果 Cron 任务有输出，考虑发送通知
+    if (output && output.length > 0 && duration !== undefined) {
+      // 检查是否需要发送到特定渠道
+      const shouldNotify = cronJob.notify_on_success === true ||
+                           (cronJob.notify_on_error === false && duration < 60000); // 示例逻辑
+
+      if (shouldNotify) {
+        // 这里可以添加通知逻辑，比如发送到 Telegram
+        console.log(`[CoreProcess] Cron 任务 ${cronJob.name} 有输出，考虑发送通知`);
+      }
+    }
+  }
+
+  /**
+   * 处理过期任务
+   */
+  private async handleOverdueTask(data: any): Promise<void> {
+    console.log(`[CoreProcess] 处理过期任务:`, data);
+
+    // 记录活动日志
+    this.db.logActivity({
+      eventType: 'task.overdue',
+      actor: 'cron_system',
+      action: 'task_overdue_detected',
+      context: data,
+    });
+
+    // 可以添加额外的处理逻辑，比如：
+    // - 发送通知
+    // - 调整任务优先级
+    // - 标记相关 Goal 为风险状态
+  }
+
+  /**
+   * 处理计划任务
+   */
+  private async handleScheduledTask(data: any): Promise<void> {
+    console.log(`[CoreProcess] 处理计划任务:`, data);
+
+    // 记录活动日志
+    this.db.logActivity({
+      eventType: 'task.scheduled',
+      actor: 'cron_system',
+      action: 'task_scheduled_executed',
+      context: data,
+    });
+
+    // 计划任务通常需要特殊处理
+    // 可能需要创建新的 Task 或触发特定的操作
+  }
+
+  /**
+   * 处理用户输入
+   */
+  private async handleUserInput(event: UserInputEvent): Promise<void> {
+    console.log(`\n[CoreProcess] 📥 用户输入: ${event.content}`);
+    console.log(`[CoreProcess] 来源: ${event.source}`);
+
+    // 记录用户输入活动
+    this.db.logActivity({
+      eventType: 'user.input',
+      actor: event.userId || 'unknown_user',
+      action: 'submit_request',
+      context: {
+        source: event.source,
+        chatId: event.chatId,
+        content: event.content.substring(0, 100),
+      },
+    });
+
+    // 1. CEO 分析意图并分配 CXO（内置核心能力，无需环境变量）
+    const { getCEO } = await import('../cxo/index.js');
+    const ceo = getCEO();
+    const analysisResult = await ceo.analyzeAndAssign(
+      event.content,
+      this.loadChatHistory(event.chatId)
+    );
+
+    console.log(`[CoreProcess] 🎯 CEO 分析完成:`);
+    console.log(`[CoreProcess]   意图类型: ${analysisResult.intentType}`);
+    console.log(`[CoreProcess]   分配给: ${analysisResult.assignedCXO}`);
+    console.log(`[CoreProcess]   原因: ${analysisResult.assignmentReason}`);
+
+    // 2. 根据 CXO 分配进行路由
+    await this.routeByCXO(analysisResult, event);
+  }
+
+  /**
+   * 根据 CXO 分配进行路由
+   */
+  private async routeByCXO(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    const { assignedCXO, intentType } = analysis;
+
+    switch (assignedCXO) {
+      case 'CEO':
+        // CEO 直接处理查询类请求
+        if (intentType === 'query') {
+          await this.handleCEOQuery(analysis, event);
+        } else {
+          // 其他情况由 CEO 进一步处理
+          await this.handleCEOTask(analysis, event);
+        }
+        break;
+
+      case 'CRO':
+        // CRO 负责员工匹配
+        await this.handleCROTask(analysis, event);
+        break;
+
+      case 'CTO':
+        // CTO 负责技术任务
+        await this.handleCTOTask(analysis, event);
+        break;
+
+      case 'CMO':
+        // CMO 负责营销任务
+        await this.handleCMOTask(analysis, event);
+        break;
+
+      case 'COO':
+        // COO 负责运营/目标/脚本
+        if (intentType === 'goal') {
+          await this.handleCOOGoal(analysis, event);
+        } else if (intentType === 'script') {
+          await this.handleCOOScript(analysis, event);
+        } else {
+          await this.handleCOOTask(analysis, event);
+        }
+        break;
+
+      case 'CFO':
+        // CFO 负责财务/分析任务
+        await this.handleCFOTask(analysis, event);
+        break;
+
+      default:
+        console.warn(`[CoreProcess] ⚠️ 未知的 CXO: ${assignedCXO}`);
+        // Fallback 到通用任务处理
+        await this.handleCROTask(analysis, event);
+        break;
+    }
+  }
+
+  /**
+   * 路由意图到相应的处理器
+   */
+  private async routeIntent(intent: Intent, event: UserInputEvent): Promise<void> {
+    switch (intent.type) {
+      case 'query':
+        await this.handleQueryIntent(intent, event);
+        break;
+      case 'goal':
+        await this.handleGoalIntent(intent, event);
+        break;
+      case 'task':
+        await this.handleTaskIntent(intent, event);
+        break;
+      case 'script':
+        await this.handleScriptIntent(intent, event);
+        break;
+      default:
+        console.warn(`[CoreProcess] ⚠️ 未知意图类型: ${(intent as any).type}`);
+        // Fallback 到 task 处理
+        await this.handleTaskIntent(intent, event);
+        break;
+    }
+  }
+
+  /**
+   * 将旧 CEOSupervisor 的 AnalysisResult 转换为新的 Intent 格式
+   */
+  private convertLegacyAnalysis(analysis: AnalysisResult): Intent {
+    // 将 query/execute 映射到 query/goal/task/script
+    let newType: Intent['type'] = 'task'; // 默认为 task
+
+    if (analysis.type === 'query') {
+      newType = 'query';
+    } else if (analysis.type === 'execute') {
+      // 根据 taskDescription 判断更具体的类型
+      const desc = (analysis.taskDescription || '').toLowerCase();
+      if (desc.includes('目标') || desc.includes('达成') || desc.includes('实现')) {
+        newType = 'goal';
+      } else if (desc.includes('脚本') || desc.includes('批量') || desc.includes('自动化')) {
+        newType = 'script';
+      } else {
+        newType = 'task';
+      }
+    }
+
+    return {
+      type: newType,
+      content: analysis.taskDescription || analysis.queryParams?.toString() || '',
+      params: {
+        queryType: analysis.queryType,
+        queryParams: analysis.queryParams,
+        taskDescription: analysis.taskDescription,
+        requiredCapabilities: analysis.requiredCapabilities,
+        suggestedEmployeeId: analysis.suggestedEmployeeId,
+        toolName: analysis.toolName,
+        toolInput: analysis.toolInput,
+      },
+      metadata: {
+        chatId: analysis.queryParams?.chatId as string | undefined,
+        timestamp: Date.now(),
+      },
+    };
+  }
+
+  /**
+   * 加载聊天历史
+   */
+  private loadChatHistory(chatId?: string): Array<{ role: 'user' | 'assistant'; content: string }> {
+    if (!chatId) return [];
+
+    try {
+      const messages = this.db.getChatHistory(chatId, 10);
+      return messages.map((msg: any) => ({
+        role: (msg.direction === 'in' ? 'user' : 'assistant') as 'user' | 'assistant',
+        content: msg.content,
+      }));
+    } catch (error) {
+      console.warn('[CoreProcess] 加载聊天历史失败:', error);
+      return [];
+    }
+  }
+
+  /**
+   * 处理查询类请求
+   */
+  private async handleQuery(analysis: AnalysisResult, inputEvent: UserInputEvent): Promise<void> {
+    const queryType = analysis.queryType || 'system_status';
+
+    console.log(`[CoreProcess] 🔍 查询类型: ${queryType}`);
+
+    try {
+      // 使用工具系统处理查询
+      const toolName = this.getQueryToolName(queryType);
+
+      // 对于 chat 工具，需要传递用户消息
+      const toolInput = queryType === 'chat'
+        ? { message: inputEvent.content }
+        : (analysis.queryParams || {});
+
+      const result = await this.toolRegistry.execute(
+        toolName,
+        toolInput,
+        this.createToolContext(inputEvent)
+      );
+
+      if (result.success) {
+        const message = result.message || JSON.stringify(result.data, null, 2);
+        this.eventBus.emit({
+          type: 'notification.needed',
+          channel: inputEvent.source === 'telegram' ? 'telegram' : 'cli',
+          chatId: inputEvent.chatId,
+          message,
+        } as any);
+      } else {
+        this.eventBus.emit({
+          type: 'notification.needed',
+          channel: inputEvent.source === 'telegram' ? 'telegram' : 'cli',
+          chatId: inputEvent.chatId,
+          message: `查询失败: ${result.error}`,
+        } as any);
+      }
+    } catch (error: any) {
+      console.error(`[CoreProcess] 查询失败: ${error.message}`);
+
+      // Fallback: 发送通用消息
+      const config = this.configManager.getConfig();
+      const ownerName = config?.ownerName || '朋友';
+      const companyName = config?.companyName || 'AI Company';
+
+      this.eventBus.emit({
+        type: 'notification.needed',
+        channel: inputEvent.source === 'telegram' ? 'telegram' : 'cli',
+        chatId: inputEvent.chatId,
+        message: queryType === 'chat' ? `你好${ownerName}！我是 ${companyName}，有什么我可以帮你做的吗？` : `查询失败，请稍后重试。`,
+      } as any);
+    }
+  }
+
+  /**
+   * 获取查询工具名称
+   */
+  private getQueryToolName(queryType: string): string {
+    const toolMap: Record<string, string> = {
+      'system_status': 'query_system_status',
+      'employees': 'list_employees',
+      'tasks': 'list_tasks',
+      'goals': 'list_goals',
+      'chat': 'chat',
+    };
+
+    return toolMap[queryType] || 'query_system_status';
+  }
+
+  /**
+   * 创建工具执行上下文
+   */
+  private createToolContext(inputEvent: UserInputEvent): any {
+    return {
+      userId: inputEvent.userId || 'default_user',
+      chatId: inputEvent.chatId || `cli_${Date.now()}`,
+      history: [],
+      inputMessage: inputEvent.content,
+    };
+  }
+
+  // ============================================================================
+  // 新 CXO 意图处理器（支持 4 种意图类型）
+  // ============================================================================
+
+  /**
+   * 处理查询类意图
+   */
+  private async handleQueryIntent(intent: Intent, inputEvent: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 🔍 查询意图处理`);
+
+    // 将 Intent 转换为 AnalysisResult 格式，复用现有的 handleQuery 逻辑
+    const queryType = (intent.params?.queryType as string) || 'system_status';
+    const validQueryTypes = ['system_status', 'employees', 'tasks', 'goals', 'chat'];
+    const validQueryType = validQueryTypes.includes(queryType) ? queryType : 'system_status';
+
+    const analysis: AnalysisResult = {
+      type: 'query',
+      queryType: validQueryType as any,
+      queryParams: intent.params?.queryParams as Record<string, unknown> | undefined,
+    };
+
+    await this.handleQuery(analysis, inputEvent);
+  }
+
+  /**
+   * 处理目标类意图（goal）
+   *
+   * 目标是长期的、需要规划的事项
+   * 例如："本月用户增长到10万"、"Q4营收达到100万"
+   */
+  private async handleGoalIntent(intent: Intent, inputEvent: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 🎯 目标意图处理: ${intent.content.substring(0, 50)}...`);
+
+    // 记录目标创建活动
+    this.db.logActivity({
+      eventType: 'goal.created',
+      actor: inputEvent.userId || 'unknown_user',
+      action: 'create_goal',
+      context: {
+        content: intent.content.substring(0, 100),
+        params: intent.params,
+        source: inputEvent.source,
+      },
+    });
+
+    // TODO: 实现 GoalManager 来管理目标
+    // 目前先发送一个通知，告诉用户目标管理功能正在开发中
+    const message = `🎯 目标已记录: ${intent.content}\n\n目标管理功能正在开发中，目前目标会被作为任务执行。`;
+
+    this.eventBus.emit({
+      type: 'notification.needed',
+      channel: inputEvent.source === 'telegram' ? 'telegram' : 'cli',
+      chatId: inputEvent.chatId,
+      message,
+    } as any);
+
+    // 将目标转换为任务执行（临时方案）
+    console.log(`[CoreProcess] 📝 将目标转换为任务执行...`);
+    await this.handleTaskIntent(intent, inputEvent);
+  }
+
+  /**
+   * 处理任务类意图（task）
+   *
+   * 任务是具体的、有明确起点的执行动作
+   * 例如："开发用户登录功能"、"写一篇产品推广文案"
+   */
+  private async handleTaskIntent(intent: Intent, inputEvent: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] ⚡ 任务意图处理: ${intent.content.substring(0, 50)}...`);
+
+    // 将 Intent 转换为 AnalysisResult 格式，复用现有的 handleExecute 逻辑
+    const analysis: AnalysisResult = {
+      type: 'execute',
+      taskDescription: intent.content,
+      requiredCapabilities: (intent.params?.requiredCapabilities as string[]) || ['analysis'],
+      suggestedEmployeeId: intent.params?.suggestedEmployeeId as string | undefined,
+    };
+
+    await this.handleExecute(analysis, inputEvent);
+  }
+
+  /**
+   * 处理脚本类意图（script）
+   *
+   * 脚本是预定义的自动化流程
+   * 例如："执行数据库备份"、"批量生成月报"
+   */
+  private async handleScriptIntent(intent: Intent, inputEvent: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 📜 脚本意图处理: ${intent.content.substring(0, 50)}...`);
+
+    // 记录脚本执行活动
+    this.db.logActivity({
+      eventType: 'script.executed',
+      actor: inputEvent.userId || 'unknown_user',
+      action: 'execute_script',
+      context: {
+        content: intent.content.substring(0, 100),
+        params: intent.params,
+        source: inputEvent.source,
+      },
+    });
+
+    // TODO: 实现 ScriptExecutor 来执行预定义脚本
+    // 目前先发送一个通知，告诉用户脚本功能正在开发中
+    const message = `📜 脚本执行: ${intent.content}\n\n脚本管理功能正在开发中，目前脚本会被作为任务执行。`;
+
+    this.eventBus.emit({
+      type: 'notification.needed',
+      channel: inputEvent.source === 'telegram' ? 'telegram' : 'cli',
+      chatId: inputEvent.chatId,
+      message,
+    } as any);
+
+    // 将脚本转换为任务执行（临时方案）
+    console.log(`[CoreProcess] 📝 将脚本转换为任务执行...`);
+    await this.handleTaskIntent(intent, inputEvent);
+  }
+
+  // ============================================================================
+  // 旧版处理器（保留兼容性）
+  // ============================================================================
+
+  /**
+   * 处理执行类请求
+   */
+  private async handleExecute(analysis: AnalysisResult, inputEvent: UserInputEvent): Promise<void> {
+    const taskDescription = analysis.taskDescription || inputEvent.content;
+    const requiredCapabilities = analysis.requiredCapabilities || ['analysis'];
+
+    console.log(`\n[CoreProcess] ⚡ 执行任务: ${taskDescription.substring(0, 50)}...`);
+    console.log(`[CoreProcess] 所需能力: ${requiredCapabilities.join(', ')}`);
+
+    const taskId = `task_${Date.now()}`;
+
+    // ========================================================================
+    // 关键决策点：收集员工上下文，让 CEO 决定用哪个 Agent
+    // ========================================================================
+
+    console.log(`[CoreProcess] 🎯 进入 Agent 决策阶段...`);
+
+    // 1. 收集员工和 Agent 信息
+    const employeeContext = await this.collectEmployeeContext();
+
+    console.log(`[CoreProcess] 📊 收集到 ${employeeContext.employees.length} 个员工`);
+    console.log(`[CoreProcess] 📦 收集到 ${employeeContext.agents.length} 个已缓存 Agents`);
+
+    // 2. 让 CEO 做决策
+    const agentDecision = await this.ceo.decideAgentStrategy({
+      task: {
+        description: taskDescription,
+        requiredCapabilities,
+      },
+      employees: employeeContext.employees,
+      availableAgents: employeeContext.agents,
+    });
+
+    console.log(`[CoreProcess] ✅ CEO 决策: ${agentDecision.strategy}`);
+    console.log(`[CoreProcess] 💭 原因: ${agentDecision.reason}`);
+
+    // 3. 根据 CEO 决策执行
+    if (agentDecision.strategy === 'use_existing') {
+      // 使用现有 Agent
+      console.log(`[CoreProcess] 🔄 复用现有 Agent: ${agentDecision.agentFile}`);
+
+      await this.executeWithExistingAgent(
+        taskId,
+        taskDescription,
+        agentDecision.agentFile!,
+        agentDecision.employeeId!,
+        inputEvent
+      );
+
+    } else if (agentDecision.strategy === 'create_new') {
+      // 创建新 Agent
+      console.log(`[CoreProcess] 🆕 创建新 Agent: ${agentDecision.newAgentConfig?.name}`);
+
+      await this.executeWithNewAgent(
+        taskId,
+        taskDescription,
+        requiredCapabilities,
+        agentDecision.newAgentConfig!,
+        inputEvent
+      );
+    }
+  }
+
+  /**
+   * 收集员工和 Agent 上下文信息
+   */
+  private async collectEmployeeContext(): Promise<{
+    employees: Array<{
+      id: string;
+      name: string;
+      role: string;
+      capabilities: string[];
+    }>;
+    agents: Array<{
+      id: string;
+      employee_id: string;
+      agent_name: string;
+      agent_file: string;
+      task_type: string;
+      task_subtype: string | null;
+      success_rate: number;
+      usage_count: number;
+    }>;
+  }> {
+    // 获取员工信息
+    const employees = this.db.prepare(`
+      SELECT id, name, role, capabilities
+      FROM employees
+      WHERE status = 'active'
+    `).all().map((row: any) => ({
+      id: row.id,
+      name: row.name,
+      role: row.role,
+      capabilities: JSON.parse(row.capabilities || '[]'),
+    }));
+
+    // 获取缓存的 Agents
+    const agents = this.db.prepare(`
+      SELECT id, employee_id, task_type, task_subtype,
+             agent_name, agent_file,
+             success_count, fail_count, success_rate,
+             usage_count, last_used_at
+      FROM employee_agents
+      ORDER BY success_rate DESC, usage_count DESC
+    `).all().map((row: any) => ({
+      id: row.id,
+      employee_id: row.employee_id,
+      agent_name: row.agent_name,
+      agent_file: row.agent_file,
+      task_type: row.task_type,
+      task_subtype: row.task_subtype,
+      success_rate: row.success_rate || 0,
+      usage_count: row.usage_count || 0,
+    }));
+
+    return { employees, agents };
+  }
+
+  /**
+   * 使用现有 Agent 执行任务
+   */
+  private async executeWithExistingAgent(
+    taskId: string,
+    taskDescription: string,
+    agentFile: string,
+    employeeId: string,
+    inputEvent: UserInputEvent
+  ): Promise<void> {
+    console.log(`[CoreProcess] 📝 任务: ${taskDescription.substring(0, 80)}...`);
+
+    // 创建数据库任务记录
+    this.db.createTask({
+      id: taskId,
+      type: 'general',
+      description: taskDescription,
+      priority: 'medium',
+      requestedBy: inputEvent.userId || 'user',
+      assignedTo: employeeId,
+    });
+
+    // 获取 Agent prompt
+    const agentPrompt = await this.getAgentPrompt(agentFile);
+
+    // 获取 Agent 信息（用于命名）
+    const agentInfo = this.db.prepare(`
+      SELECT agent_name, task_type FROM employee_agents
+      WHERE agent_file = ?
+    `).get(agentFile) || { agent_name: 'Agent', task_type: 'general' };
+
+    console.log(`[CoreProcess] 🤖 使用 Agent: ${agentInfo.agent_name}`);
+
+    // 发出任务开始事件
+    this.eventBus.emit({
+      type: 'task.started',
+      taskId,
+      employeeId,
+      source: inputEvent.source,
+      chatId: inputEvent.chatId,
+      userId: inputEvent.userId,
+      timestamp: Date.now(),
+    } as any);
+
+    try {
+      // 创建 API 模式执行器（替代 TaskSessionManager）
+      const { getAPIAgentExecutor } = await import('../execution/APIAgentExecutor.js');
+      const executor = getAPIAgentExecutor({
+        agentId: taskId,
+        agentName: agentInfo.agent_name,
+        systemPrompt: agentPrompt,
+        maxTurns: 10,
+        timeout: 300000, // 5 分钟
+        taskId,
+        userId: inputEvent.userId,
+        chatId: inputEvent.chatId,
+      });
+
+      // 执行任务
+      const result = await executor.execute(taskDescription);
+
+      console.log(`[CoreProcess] ✅ 任务完成: ${result.success ? '成功' : '失败'}`);
+      if (result.output) {
+        console.log(`[CoreProcess] 输出: ${result.output.substring(0, 100)}...`);
+      }
+
+      // 发出任务完成事件
+      this.eventBus.emit({
+        type: 'task.completed',
+        taskId,
+        employeeId,
+        source: inputEvent.source,
+        chatId: inputEvent.chatId,
+        userId: inputEvent.userId,
+        result: {
+          success: result.success,
+          output: result.output,
+          artifacts: result.artifacts,
+        },
+        taskDescription: taskDescription.substring(0, 100),
+        duration: result.usage ? (result.usage.inputTokens + result.usage.outputTokens) : 0,
+        timestamp: Date.now(),
+      } as any);
+
+      // 更新 Agent 使用统计
+      const { getEmployeeAgentManager } = await import('../agents/EmployeeAgentManager.js');
+      const agentManager = getEmployeeAgentManager(this.db);
+      agentManager.recordUsage(
+        this.extractAgentIdFromFile(agentFile),
+        result.success,
+        result.success ? 8 : 0
+      );
+
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ 任务执行失败: ${error.message}`);
+
+      // 发出任务失败事件
+      this.eventBus.emit({
+        type: 'task.failed',
+        taskId,
+        employeeId,
+        source: inputEvent.source,
+        chatId: inputEvent.chatId,
+        userId: inputEvent.userId,
+        error: error.message,
+        timestamp: Date.now(),
+      } as any);
+    }
+  }
+
+  /**
+   * 创建新 Agent 并执行任务
+   */
+  private async executeWithNewAgent(
+    taskId: string,
+    taskDescription: string,
+    requiredCapabilities: string[],
+    agentConfig: {
+      employeeId: string;
+      name: string;
+      taskType: string;
+      taskSubtype: string | null;
+      prompt: string;
+    },
+    inputEvent: UserInputEvent
+  ): Promise<void> {
+    // 日志已在决策处理中输出，避免重复
+
+    const { getEmployeeAgentManager } = await import('../agents/EmployeeAgentManager.js');
+    const agentManager = getEmployeeAgentManager(this.db);
+
+    try {
+      // 1. 创建 Claude Agent 文件（保留，用于备份）
+      const agentFile = await agentManager.createClaudeAgentFile({
+        name: agentConfig.name,
+        prompt: agentConfig.prompt,
+      });
+
+      // 2. 保存到数据库
+      const savedAgent = agentManager.saveAgent({
+        employee_id: agentConfig.employeeId,
+        task_type: agentConfig.taskType,
+        task_subtype: agentConfig.taskSubtype,
+        agent_name: agentConfig.name,
+        agent_file: agentFile,
+        prompt_content: agentConfig.prompt,
+      });
+
+      console.log(`[CoreProcess] ✅ Agent 已保存到数据库: ${savedAgent.id}`);
+
+      // 3. 创建数据库任务记录
+      this.db.createTask({
+        id: taskId,
+        type: 'general',
+        description: taskDescription,
+        priority: 'medium',
+        requestedBy: inputEvent.userId || 'user',
+        assignedTo: agentConfig.employeeId,
+      });
+
+      // 4. 创建 API 模式执行器（替代 TaskSessionManager）
+      const { getAPIAgentExecutor } = await import('../execution/APIAgentExecutor.js');
+      const executor = getAPIAgentExecutor({
+        agentId: taskId,
+        agentName: agentConfig.name,
+        systemPrompt: agentConfig.prompt,
+        maxTurns: 10,
+        timeout: 300000, // 5 分钟
+        taskId,
+        userId: inputEvent.userId,
+        chatId: inputEvent.chatId,
+      });
+
+      console.log(`[CoreProcess] 🚀 启动 API Agent 执行器`);
+
+      // 发出任务开始事件
+      this.eventBus.emit({
+        type: 'task.started',
+        taskId,
+        employeeId: agentConfig.employeeId,
+        source: inputEvent.source,
+        chatId: inputEvent.chatId,
+        userId: inputEvent.userId,
+        timestamp: Date.now(),
+      } as any);
+
+      // 5. 执行任务
+      const result = await executor.execute(taskDescription);
+
+      console.log(`[CoreProcess] ✅ 任务完成: ${result.success ? '成功' : '失败'}`);
+      if (result.output) {
+        console.log(`[CoreProcess] 输出: ${result.output.substring(0, 100)}...`);
+      }
+
+      // 6. 更新 Agent 统计
+      agentManager.recordUsage(
+        savedAgent.id,
+        result.success,
+        result.success ? 8 : 0
+      );
+
+      // 7. 发出完成事件
+      this.eventBus.emit({
+        type: 'task.completed',
+        taskId,
+        employeeId: agentConfig.employeeId,
+        source: inputEvent.source,
+        chatId: inputEvent.chatId,
+        userId: inputEvent.userId,
+        result: {
+          success: result.success,
+          output: result.output,
+          artifacts: result.artifacts,
+        },
+        taskDescription: taskDescription.substring(0, 100),
+        duration: result.usage ? (result.usage.inputTokens + result.usage.outputTokens) : 0,
+        timestamp: Date.now(),
+      } as any);
+
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ 创建/执行 Agent 失败: ${error.message}`);
+
+      // 发出任务失败事件
+      this.eventBus.emit({
+        type: 'task.failed',
+        taskId,
+        employeeId: agentConfig.employeeId,
+        source: inputEvent.source,
+        chatId: inputEvent.chatId,
+        userId: inputEvent.userId,
+        error: error.message,
+        timestamp: Date.now(),
+      } as any);
+    }
+  }
+
+  /**
+   * 从 agent 文件路径提取 agent ID（简化版本）
+   */
+  private extractAgentIdFromFile(agentFile: string): string {
+    // 从 ~/.claude/agents/xxx.md 中提取 xxx
+    const match = agentFile.match(/\/([^\/]+)\.md$/);
+    return match ? match[1] : 'unknown';
+  }
+
+  /**
+   * 获取 Agent 的 System Prompt
+   * @param agentFile - Agent 文件路径或标识
+   * @returns Agent 的 system prompt
+   */
+  private async getAgentPrompt(agentFile: string): Promise<string> {
+    const { readFile } = await import('fs/promises');
+
+    // 尝试从文件系统读取
+    try {
+      const content = await readFile(agentFile, 'utf-8');
+      // 提取 frontmatter 之后的 prompt 部分
+      const parts = content.split('---');
+      if (parts.length >= 3) {
+        return parts.slice(2).join('---').trim();
+      }
+      return content;
+    } catch (fileError) {
+      // 文件不存在，尝试从数据库读取
+      const row = this.db.prepare(`
+        SELECT prompt_content FROM employee_agents
+        WHERE agent_file = ? OR id = ?
+      `).get(agentFile, agentFile);
+
+      if (row && row.prompt_content) {
+        return row.prompt_content;
+      }
+    }
+
+    // 如果都找不到，返回默认 prompt
+    console.warn(`[CoreProcess] ⚠️  找不到 Agent prompt: ${agentFile}，使用默认 prompt`);
+    return `# AI Agent
+
+You are an AI assistant designed to help complete tasks efficiently.
+
+## Instructions
+1. Understand the task requirements
+2. Use available tools to complete the task
+3. Provide clear and helpful responses
+4. Report any issues or blockers`;
+  }
+
+  /**
+   * 处理任务（带重试机制）
+   */
+  private async processTaskWithRetry(
+    taskId: string,
+    description: string,
+    requiredCapabilities: string[],
+    employeeId: string,
+    inputEvent: UserInputEvent
+  ): Promise<void> {
+    const MAX_RETRIES = 3;
+    const INITIAL_DELAY = 2000; // 2 秒
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await this.processTaskInternal(
+          taskId,
+          description,
+          requiredCapabilities,
+          employeeId,
+          inputEvent
+        );
+        // 成功，退出重试循环
+        return;
+      } catch (error: any) {
+        console.error(`[CoreProcess] ❌ 任务失败 (尝试 ${attempt}/${MAX_RETRIES}): ${error.message}`);
+
+        // 判断是否应该重试
+        const shouldRetry = this.shouldRetryTask(error, attempt);
+
+        if (!shouldRetry || attempt >= MAX_RETRIES) {
+          // 不重试或已达到最大重试次数
+          console.error(`[CoreProcess] ❌ 任务最终失败: ${taskId}`);
+
+          // 发出任务失败事件（包含来源信息，用于结果返回）
+          this.eventBus.emit({
+            type: 'task.failed',
+            taskId,
+            employeeId,
+            source: inputEvent.source || 'cli',
+            chatId: inputEvent.chatId,
+            userId: inputEvent.userId,
+            error: error.message,
+            timestamp: Date.now(),
+            retryAttempts: attempt,
+          } as any);
+
+          // 清理对应的 Agent
+          const agent = this.activeAgents.get(employeeId);
+          if (agent) {
+            this.activeAgents.delete(employeeId);
+            this.agentLastUsed.delete(employeeId);
+            console.log(`[CoreProcess] 清理失败任务的 Agent: ${employeeId}`);
+          }
+
+          // 添加到失败队列以供后续自动重试
+          this.addToFailedQueue(
+            taskId,
+            description,
+            requiredCapabilities,
+            employeeId,
+            inputEvent,
+            error
+          );
+
+          return;
+        }
+
+        // 计算退避延迟（指数退避）
+        const delay = INITIAL_DELAY * Math.pow(2, attempt - 1);
+        console.log(`[CoreProcess] ⏳ 等待 ${delay}ms 后重试...`);
+        await this.sleep(delay);
+
+        // 创建新的 taskId 用于重试
+        const retryTaskId = `${taskId}-retry-${attempt}`;
+        console.log(`[CoreProcess] 🔄 重试任务: ${retryTaskId}`);
+
+        // 更新数据库任务记录
+        this.db.updateTaskStatus(taskId, 'retrying');
+        this.db.logActivity({
+          eventType: 'task.retry',
+          actor: 'core_process',
+          action: 'retry_task',
+          context: {
+            originalTaskId: taskId,
+            retryTaskId: retryTaskId,
+            attempt,
+            error: error.message,
+          },
+        });
+      }
+    }
+  }
+
+  /**
+   * 判断任务是否应该重试
+   */
+  private shouldRetryTask(error: Error, attempt: number): boolean {
+    const nonRetryableErrors = [
+      '权限',
+      'permission',
+      'denied',
+      'invalid',
+      'not found',
+      'not exist',
+      '能力',
+      'capability',
+    ];
+
+    const errorMsg = error.message.toLowerCase();
+
+    // 检查是否是不可重试的错误
+    for (const keyword of nonRetryableErrors) {
+      if (errorMsg.includes(keyword)) {
+        console.log(`[CoreProcess] ⚠️ 不可重试错误: ${keyword}`);
+        return false;
+      }
+    }
+
+    // 网络错误、临时性错误可重试
+    const retryableErrors = [
+      'timeout',
+      'network',
+      'connection',
+      'temporary',
+      'rate limit',
+      'econnrefused',
+      'econnreset',
+      'etimedout',
+    ];
+
+    for (const keyword of retryableErrors) {
+      if (errorMsg.includes(keyword)) {
+        return true;
+      }
+    }
+
+    // 默认：第 1 次失败时重试，之后不再重试
+    return attempt === 1;
+  }
+
+  /**
+   * 异步休眠
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * 处理任务（内部实现）
+   */
+  private async processTaskInternal(
+    taskId: string,
+    description: string,
+    requiredCapabilities: string[],
+    employeeId: string,
+    inputEvent: UserInputEvent
+  ): Promise<void> {
+    console.log(`[CoreProcess] ⚙️ 开始处理任务: ${taskId}`);
+
+    // 保存任务的来源信息（用于结果返回）
+    const taskSource = inputEvent.source || 'cli';
+    const taskChatId = inputEvent.chatId || `cli_${Date.now()}`;
+    const taskUserId = inputEvent.userId || 'default_user';
+
+    // 发出任务开始事件（包含来源信息）
+    this.eventBus.emit({
+      type: 'task.started',
+      taskId,
+      source: taskSource,
+      chatId: taskChatId,
+      userId: taskUserId,
+      timestamp: Date.now(),
+    } as any);
+
+    // 更新任务状态
+    this.db.updateTaskStatus(taskId, 'executing');
+
+    try {
+      // 1. 获取员工定义
+      const agentFactory = getAgentFactory(this.db);
+      const agentDefinition = await agentFactory.getOrCreateAgent({
+        taskDescription: description,
+        requiredCapabilities,
+        context: `来源: ${taskSource}`,
+      });
+
+      // 2. 创建 Agent 实例
+      let agent = this.activeAgents.get(agentDefinition.id);
+      if (!agent) {
+        agent = new DynamicAgent(agentDefinition);
+        await agent.initialize();
+        this.activeAgents.set(agentDefinition.id, agent);
+      }
+
+      // 更新最后使用时间
+      this.agentLastUsed.set(agentDefinition.id, Date.now());
+
+      console.log(`[CoreProcess] 🤖 使用 Agent: ${agent.name}`);
+
+      // 3. 执行任务
+      const startTime = Date.now();
+      const result = await agent.executeTask({
+        id: taskId,
+        description,
+        requiredCapabilities,
+        priority: 'medium',
+      });
+      const duration = Date.now() - startTime;
+
+      // 4. 发出任务完成事件（包含来源信息，用于结果返回）
+      this.eventBus.emit({
+        type: 'task.completed',
+        taskId,
+        employeeId,
+        source: taskSource,
+        chatId: taskChatId,
+        userId: taskUserId,
+        result: {
+          success: result.success,
+          output: result.output,
+          artifacts: result.artifacts,
+        },
+        taskDescription: description,
+        duration,
+        timestamp: Date.now(),
+      } as any);
+
+    } catch (error: any) {
+      // 错误由外层的重试逻辑处理
+      throw error;
+    }
+  }
+
+  // ============================================================================
+  // CXO 处理器（新的架构）
+  // ============================================================================
+
+  /**
+   * CEO 处理请求
+   */
+  private async handleCEOQuery(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 📊 CEO 处理: ${analysis.userInput.substring(0, 50)}...`);
+
+    const { params } = analysis;
+    const action = params?.action as string;
+    const suggestedTool = params?.suggestedTool as string;
+
+    console.log(`[CoreProcess] 🎯 CEO 决策: ${action}`);
+    console.log(`[CoreProcess] 🛠️  建议工具: ${suggestedTool || '无'}`);
+
+    // 根据决策执行
+    if (action === '外部信息查询') {
+      await this.handleExternalInfoQuery(analysis, event);
+    } else if (action === '系统状态查询') {
+      await this.handleSystemQuery(analysis, event);
+    } else {
+      // Fallback
+      await this.handleCROTask(analysis, event);
+    }
+  }
+
+  /**
+   * 处理外部信息查询
+   */
+  private async handleExternalInfoQuery(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 🌐 外部信息查询：${analysis.userInput.substring(0, 50)}...`);
+
+    try {
+      const result = await this.toolRegistry.execute(
+        'HTTP',
+        {
+          url: 'https://www.baidu.com/s?wd=' + encodeURIComponent(analysis.userInput),
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          },
+        },
+        this.createToolContext(event)
+      );
+
+      if (result.success && result.data) {
+        const responseData = result.data;
+        const status = responseData.status;
+        const body = responseData.body || responseData.data;
+
+        if (status === 200 && body) {
+          // 简单提取文本内容（移除 HTML 标签）
+          let textContent = '';
+          if (typeof body === 'string') {
+            textContent = body
+              .replace(/<script[^>]*>[\s\S]*?<\/script>/g, '')
+              .replace(/<style[^>]*>[\s\S]*?<\/style>/g, '')
+              .replace(/<[^>]+>/g, '\n')
+              .replace(/&nbsp;/g, ' ')
+              .replace(/&amp;/g, '&')
+              .replace(/&lt;/g, '<')
+              .replace(/&gt;/g, '>')
+              .replace(/\s+/g, ' ')
+              .trim();
+          } else if (typeof body === 'object') {
+            textContent = JSON.stringify(body, null, 2);
+          }
+
+          // 截取前 800 字符作为摘要
+          const summary = textContent.substring(0, 800);
+          const message = `🔍 ${analysis.userInput}\n\n已获取外部信息，摘要如下：\n\n${summary}\n\n（如需更详细内容，请使用浏览器工具查看）`;
+
+          this.eventBus.emit({
+            type: 'notification.needed',
+            channel: event.source === 'telegram' ? 'telegram' : 'cli',
+            chatId: event.chatId,
+            message,
+          } as any);
+          return;
+        }
+      }
+
+      throw new Error(`HTTP 返回状态：${result.data?.status || '未知'}`);
+    } catch (error: any) {
+      console.error(`[CoreProcess] 外部信息查询失败:`, error);
+      this.eventBus.emit({
+        type: 'notification.needed',
+        channel: event.source === 'telegram' ? 'telegram' : 'cli',
+        chatId: event.chatId,
+        message: `抱歉，获取外部信息失败：${error.message}`,
+      } as any);
+    }
+  }
+
+  /**
+   * 处理系统查询
+   */
+  private async handleSystemQuery(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    const input = analysis.userInput.toLowerCase();
+
+    let queryType = 'system_status';
+    if (input.includes('员工')) queryType = 'employees';
+    else if (input.includes('任务')) queryType = 'tasks';
+    else if (input.includes('目标')) queryType = 'goals';
+
+    const result: AnalysisResult = {
+      type: 'query',
+      queryType: queryType as any,
+      queryParams: analysis.params,
+    };
+
+    await this.handleQuery(result, event);
+  }
+
+  /**
+   * CEO 处理其他任务
+   */
+  private async handleCEOTask(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 📋 CEO 处理任务: ${analysis.userInput.substring(0, 50)}...`);
+
+    // CEO 任务交给 CRO 处理员工匹配
+    await this.handleCROTask(analysis, event);
+  }
+
+  /**
+   * CRO 处理任务（员工匹配 + CXO 执行）
+   */
+  private async handleCROTask(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 👥 CRO 处理任务: ${analysis.userInput.substring(0, 50)}...`);
+
+    try {
+      // 1. CRO 匹配员工
+      const { getCRO } = await import('../cxo/index.js');
+      const cro = getCRO();
+
+      // 收集可用员工
+      const employees = this.db.prepare(`
+        SELECT id, name, role, capabilities
+        FROM employees
+        WHERE status = 'active'
+      `).all().map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        role: row.role,
+        capabilities: JSON.parse(row.capabilities || '[]'),
+      }));
+
+      const requirements: TaskRequirements = {
+        description: analysis.userInput,
+        requiredCapabilities: analysis.params?.requiredCapabilities as string[] || ['analysis'],
+      };
+
+      // 2. CRO 匹配员工（可能招聘新员工）
+      const employeeMatch = await cro.findEmployee(requirements, employees);
+
+      console.log(`[CoreProcess] 👤 CRO 匹配员工: ${employeeMatch.employee.name} (${employeeMatch.employee.role})`);
+      console.log(`[CoreProcess] 💭 原因: ${employeeMatch.matchReason}`);
+      console.log(`[CoreProcess] 🆕 新员工: ${employeeMatch.isNew ? '是' : '否'}`);
+
+      // 3. 根据员工角色路由到相应的 CXO 执行器
+      await this.executeByEmployeeRole(employeeMatch, requirements, event);
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ CRO 处理失败: ${error.message}`);
+      await this.handleExecutionError(error, event);
+    }
+  }
+
+  /**
+   * 根据员工角色执行任务
+   */
+  private async executeByEmployeeRole(
+    employeeMatch: any,
+    requirements: TaskRequirements,
+    event: UserInputEvent
+  ): Promise<void> {
+    const { employee, agentPrompt } = employeeMatch;
+    const role = employee.role;
+
+    console.log(`[CoreProcess] 🎯 根据 ${role} 执行任务`);
+
+    try {
+      switch (role) {
+        case 'CTO':
+          const { getCTO } = await import('../cxo/index.js');
+          const cto = getCTO();
+          const ctoResult = await cto.execute(requirements, agentPrompt);
+          await this.handleExecutionResult(ctoResult, event);
+          break;
+
+        case 'CMO':
+          const { getCMO } = await import('../cxo/index.js');
+          const cmo = getCMO();
+          const cmoResult = await cmo.execute(requirements, agentPrompt);
+          await this.handleExecutionResult(cmoResult, event);
+          break;
+
+        case 'COO':
+          const { getCOO } = await import('../cxo/index.js');
+          const coo = getCOO();
+          const cooResult = await coo.execute(requirements, agentPrompt);
+          await this.handleExecutionResult(cooResult, event);
+          break;
+
+        case 'CFO':
+          const { getCFO } = await import('../cxo/index.js');
+          const cfo = getCFO();
+          const cfoResult = await cfo.execute(requirements, agentPrompt);
+          await this.handleExecutionResult(cfoResult, event);
+          break;
+
+        default:
+          console.warn(`[CoreProcess] ⚠️ 未知角色: ${role}，使用通用执行器`);
+          // Fallback 到现有的 handleExecute
+          const result: AnalysisResult = {
+            type: 'execute',
+            taskDescription: requirements.description,
+            requiredCapabilities: requirements.requiredCapabilities,
+          };
+          await this.handleExecute(result, event);
+          break;
+      }
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ 执行失败: ${error.message}`);
+      await this.handleExecutionError(error, event);
+    }
+  }
+
+  /**
+   * CTO 处理技术任务
+   */
+  private async handleCTOTask(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 💻 CTO 处理技术任务: ${analysis.userInput.substring(0, 50)}...`);
+
+    try {
+      // 使用 CTO 执行器
+      const { getCTO } = await import('../cxo/index.js');
+      const cto = getCTO();
+
+      // 获取 CTO 的 system prompt
+      const employee = this.db.prepare('SELECT system_prompt FROM employees WHERE id = ?').bind('emp-cto').get() as any;
+      const agentPrompt = employee?.system_prompt || '你是技术专家，负责技术任务。';
+
+      const requirements: TaskRequirements = {
+        description: analysis.userInput,
+        requiredCapabilities: analysis.params?.requiredCapabilities as string[] || ['coding'],
+      };
+
+      const result: ExecutionResult = await cto.execute(requirements, agentPrompt);
+
+      // 处理执行结果
+      await this.handleExecutionResult(result, event);
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ CTO 执行失败: ${error.message}`);
+      await this.handleExecutionError(error, event);
+    }
+  }
+
+  /**
+   * CMO 处理营销任务
+   */
+  private async handleCMOTask(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 📢 CMO 处理营销任务: ${analysis.userInput.substring(0, 50)}...`);
+
+    try {
+      // 使用 CMO 执行器
+      const { getCMO } = await import('../cxo/index.js');
+      const cmo = getCMO();
+
+      // 获取 CMO 的 system prompt
+      const employee = this.db.prepare('SELECT system_prompt FROM employees WHERE id = ?').bind('emp-cmo').get() as any;
+      const agentPrompt = employee?.system_prompt || '你是营销专家，负责营销任务。';
+
+      const requirements: TaskRequirements = {
+        description: analysis.userInput,
+        requiredCapabilities: analysis.params?.requiredCapabilities as string[] || ['writing', 'marketing'],
+      };
+
+      const result: ExecutionResult = await cmo.execute(requirements, agentPrompt);
+
+      // 处理执行结果
+      await this.handleExecutionResult(result, event);
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ CMO 执行失败: ${error.message}`);
+      await this.handleExecutionError(error, event);
+    }
+  }
+
+  /**
+   * COO 处理运营任务
+   */
+  private async handleCOOTask(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] ⚙️ COO 处理运营任务: ${analysis.userInput.substring(0, 50)}...`);
+
+    try {
+      // 使用 COO 执行器
+      const { getCOO } = await import('../cxo/index.js');
+      const coo = getCOO();
+
+      // 获取 COO 的 system prompt
+      const employee = this.db.prepare('SELECT system_prompt FROM employees WHERE id = ?').bind('emp-coo').get() as any;
+      const agentPrompt = employee?.system_prompt || '你是运营专家，负责运营任务。';
+
+      const requirements: TaskRequirements = {
+        description: analysis.userInput,
+        requiredCapabilities: analysis.params?.requiredCapabilities as string[] || ['planning', 'management'],
+      };
+
+      const result: ExecutionResult = await coo.execute(requirements, agentPrompt);
+
+      // 处理执行结果
+      await this.handleExecutionResult(result, event);
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ COO 执行失败: ${error.message}`);
+      await this.handleExecutionError(error, event);
+    }
+  }
+
+  /**
+   * COO 处理目标
+   */
+  private async handleCOOGoal(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 🎯 COO 处理目标: ${analysis.userInput.substring(0, 50)}...`);
+
+    // 发送目标记录通知
+    const message = `🎯 目标已记录: ${analysis.userInput}\n\n💡 ${analysis.assignmentReason}\n\n📋 下一步: ${analysis.nextSteps?.join(' → ') || '待定'}`;
+
+    this.eventBus.emit({
+      type: 'notification.needed',
+      channel: event.source === 'telegram' ? 'telegram' : 'cli',
+      chatId: event.chatId,
+      message,
+    } as any);
+
+    // TODO: 实现 GoalManager 来管理目标
+    // 目前使用 COO 执行器处理目标
+    try {
+      const { getCOO } = await import('../cxo/index.js');
+      const coo = getCOO();
+
+      const employee = this.db.prepare('SELECT system_prompt FROM employees WHERE id = ?').bind('emp-coo').get() as any;
+      const agentPrompt = employee?.system_prompt || '你是运营专家，负责目标和运营管理。';
+
+      const requirements: TaskRequirements = {
+        description: analysis.userInput,
+        requiredCapabilities: ['planning', 'management'],
+      };
+
+      const result: ExecutionResult = await coo.execute(requirements, agentPrompt);
+      await this.handleExecutionResult(result, event);
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ COO 目标处理失败: ${error.message}`);
+      await this.handleExecutionError(error, event);
+    }
+  }
+
+  /**
+   * COO 处理脚本
+   */
+  private async handleCOOScript(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 📜 COO 处理脚本: ${analysis.userInput.substring(0, 50)}...`);
+
+    // 发送脚本执行通知
+    const message = `📜 脚本执行: ${analysis.userInput}\n\n💡 ${analysis.assignmentReason}`;
+
+    this.eventBus.emit({
+      type: 'notification.needed',
+      channel: event.source === 'telegram' ? 'telegram' : 'cli',
+      chatId: event.chatId,
+      message,
+    } as any);
+
+    // TODO: 实现 ScriptExecutor 来执行脚本
+    // 目前使用 COO 执行器处理脚本
+    try {
+      const { getCOO } = await import('../cxo/index.js');
+      const coo = getCOO();
+
+      const employee = this.db.prepare('SELECT system_prompt FROM employees WHERE id = ?').bind('emp-coo').get() as any;
+      const agentPrompt = employee?.system_prompt || '你是运营专家，负责脚本执行。';
+
+      const requirements: TaskRequirements = {
+        description: analysis.userInput,
+        requiredCapabilities: ['automation', 'scripting'],
+      };
+
+      const result: ExecutionResult = await coo.execute(requirements, agentPrompt);
+      await this.handleExecutionResult(result, event);
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ COO 脚本执行失败: ${error.message}`);
+      await this.handleExecutionError(error, event);
+    }
+  }
+
+  /**
+   * CFO 处理财务/分析任务
+   */
+  private async handleCFOTask(analysis: CEOAnalysisResult, event: UserInputEvent): Promise<void> {
+    console.log(`[CoreProcess] 📊 CFO 处理财务/分析任务: ${analysis.userInput.substring(0, 50)}...`);
+
+    try {
+      // 使用 CFO 执行器
+      const { getCFO } = await import('../cxo/index.js');
+      const cfo = getCFO();
+
+      // 获取 CFO 的 system prompt
+      const employee = this.db.prepare('SELECT system_prompt FROM employees WHERE id = ?').bind('emp-cfo').get() as any;
+      const agentPrompt = employee?.system_prompt || '你是财务专家，负责财务和分析任务。';
+
+      const requirements: TaskRequirements = {
+        description: analysis.userInput,
+        requiredCapabilities: analysis.params?.requiredCapabilities as string[] || ['analysis', 'finance', 'data'],
+      };
+
+      const result: ExecutionResult = await cfo.execute(requirements, agentPrompt);
+
+      // 处理执行结果
+      await this.handleExecutionResult(result, event);
+    } catch (error: any) {
+      console.error(`[CoreProcess] ❌ CFO 执行失败: ${error.message}`);
+      await this.handleExecutionError(error, event);
+    }
+  }
+
+  /**
+   * 处理执行结果
+   */
+  private async handleExecutionResult(result: ExecutionResult, event: UserInputEvent): Promise<void> {
+    if (result.success) {
+      console.log(`[CoreProcess] ✅ 执行成功`);
+
+      // 发送成功通知
+      let message = result.output || '任务已完成';
+
+      // 如果有 artifacts，添加到消息中
+      if (result.artifacts && result.artifacts.length > 0) {
+        message += '\n\n📦 产物:\n';
+        for (const artifact of result.artifacts) {
+          message += `  - ${artifact.type}: ${artifact.description || artifact.content || artifact.path}\n`;
+        }
+      }
+
+      this.eventBus.emit({
+        type: 'notification.needed',
+        channel: event.source === 'telegram' ? 'telegram' : 'cli',
+        chatId: event.chatId,
+        message,
+      } as any);
+    } else {
+      // 执行失败，发送错误通知
+      const message = `❌ 任务执行失败: ${result.error || '未知错误'}`;
+      this.eventBus.emit({
+        type: 'notification.needed',
+        channel: event.source === 'telegram' ? 'telegram' : 'cli',
+        chatId: event.chatId,
+        message,
+      } as any);
+    }
+  }
+
+  /**
+   * 处理执行错误
+   */
+  private async handleExecutionError(error: Error, event: UserInputEvent): Promise<void> {
+    const message = `❌ 执行出错: ${error.message}`;
+    this.eventBus.emit({
+      type: 'notification.needed',
+      channel: event.source === 'telegram' ? 'telegram' : 'cli',
+      chatId: event.chatId,
+      message,
+    } as any);
+  }
+}
+
+// 单例
+let coreProcessInstance: CoreProcess | null = null;
+
+export function getCoreProcess(): CoreProcess {
+  if (!coreProcessInstance) {
+    coreProcessInstance = new CoreProcess();
+  }
+  return coreProcessInstance;
+}

@@ -1,0 +1,4 @@
+# 此目录用于存储运行时数据
+# - database.db: SQLite 数据库
+# - cookies.json: 登录会话
+# - logs/: 错误截图和日志

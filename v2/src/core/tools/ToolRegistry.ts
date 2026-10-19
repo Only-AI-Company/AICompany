@@ -1,446 +1,413 @@
 /**
  * AI Company v2 - Tool Registry
- * 工具注册中心：负责工具的注册和查询
+ *
+ * 工具注册中心：管理所有工具的注册、查询、执行
  */
 
-import type { Tool, ToolContext, ToolResult, ToolParameter } from './types.js';
-import { ToolCategory } from './types.js';
-import { getGoalManager } from '../Goal.js';
-import { getEmployeeService } from '../Employee.js';
-import type { AIDatabase } from '../../db/Database.js';
+import type {
+  Tool,
+  ToolContext,
+  ToolResult,
+  ToolExecutionLog,
+  ToolRegistryConfig,
+  AnthropicToolSchema,
+  ToolExecuteOptions,
+} from './types.js';
 
-/**
- * 参数验证器
- */
-class ParameterValidator {
-  static validate(
-    params: Record<string, unknown>,
-    definition: Record<string, ToolParameter>
-  ): { valid: boolean; error?: string } {
-    for (const [key, param] of Object.entries(definition)) {
-      // 检查必需参数
-      if (param.required && params[key] === undefined) {
-        return { valid: false, error: `Missing required parameter: ${key}` };
-      }
+// ============================================================================
+// 工具注册表
+// ============================================================================
 
-      // 检查类型
-      if (params[key] !== undefined) {
-        const value = params[key];
-        const typeError = this.checkType(value, param);
-        if (typeError) {
-          return { valid: false, error: `Parameter ${key}: ${typeError}` };
-        }
-
-        // 检查枚举值
-        if (param.enum && typeof value === 'string' && !param.enum.includes(value)) {
-          return {
-            valid: false,
-            error: `Parameter ${key} must be one of: ${param.enum.join(', ')}`,
-          };
-        }
-      }
-    }
-    return { valid: true };
-  }
-
-  private static checkType(value: unknown, param: ToolParameter): string | null {
-    switch (param.type) {
-      case 'string':
-        return typeof value !== 'string' ? 'must be a string' : null;
-      case 'number':
-        return typeof value !== 'number' ? 'must be a number' : null;
-      case 'boolean':
-        return typeof value !== 'boolean' ? 'must be a boolean' : null;
-      case 'object':
-        return typeof value !== 'object' || value === null ? 'must be an object' : null;
-      case 'array':
-        return !Array.isArray(value) ? 'must be an array' : null;
-      default:
-        return null;
-    }
-  }
-}
-
-/**
- * 工具注册表
- */
 export class ToolRegistry {
-  private tools = new Map<string, Tool>();
+  private tools: Map<string, Tool> = new Map();
+  private executionHistory: ToolExecutionLog[] = [];
+  private rateLimitMap: Map<string, number[]> = new Map();
+
+  private config: ToolRegistryConfig = {
+    enableLogging: true,
+    enableRateLimit: true,
+    rateLimitPerMinute: 60,
+    defaultTimeout: 30000, // 30 秒
+  };
+
+  constructor(config?: Partial<ToolRegistryConfig>) {
+    if (config) {
+      this.config = { ...this.config, ...config };
+    }
+  }
+
+  // ============================================================================
+  // 工具注册
+  // ============================================================================
 
   /**
-   * 注册工具
+   * 注册单个工具
    */
   register(tool: Tool): void {
     if (this.tools.has(tool.name)) {
-      console.warn(`[ToolRegistry] Tool "${tool.name}" already registered, overwriting`);
+      console.warn(`[ToolRegistry] 工具已存在，覆盖：${tool.name}`);
     }
     this.tools.set(tool.name, tool);
+    console.log(`[ToolRegistry] 已注册工具：${tool.name} (${tool.category})`);
   }
 
   /**
    * 批量注册工具
    */
-  registerAll(tools: Tool[]): void {
+  registerMany(tools: Tool[]): void {
     for (const tool of tools) {
       this.register(tool);
     }
   }
 
   /**
-   * 获取工具
+   * 注销工具
    */
-  get(name: string): Tool | undefined {
-    return this.tools.get(name);
+  unregister(toolName: string): boolean {
+    return this.tools.delete(toolName);
   }
 
+  // ============================================================================
+  // 工具查询
+  // ============================================================================
+
   /**
-   * 检查工具是否存在
+   * 获取单个工具
    */
-  has(name: string): boolean {
-    return this.tools.has(name);
+  get(toolName: string): Tool | undefined {
+    return this.tools.get(toolName);
   }
 
   /**
    * 获取所有工具
    */
-  getAll(category?: ToolCategory): Tool[] {
-    const allTools = Array.from(this.tools.values());
-    if (category) {
-      return allTools.filter(t => t.category === category);
-    }
-    return allTools;
+  getAll(): Tool[] {
+    return Array.from(this.tools.values());
   }
 
   /**
-   * 获取工具名称列表
+   * 获取所有启用的工具
    */
-  getNames(): string[] {
-    return Array.from(this.tools.keys());
+  getAllEnabled(): Tool[] {
+    return this.getAll().filter(tool => tool.enabled !== false);
   }
 
   /**
-   * 获取工具数量
+   * 按分类获取工具
    */
-  size(): number {
-    return this.tools.size;
+  getByCategory(category: string): Tool[] {
+    return this.getAll().filter(tool => tool.category === category);
   }
-}
 
-/**
- * 工具执行器
- */
-export class ToolExecutor {
+  /**
+   * 检查工具是否存在
+   */
+  has(toolName: string): boolean {
+    return this.tools.has(toolName);
+  }
+
+  // ============================================================================
+  // 工具执行
+  // ============================================================================
+
   /**
    * 执行工具
    */
   async execute(
-    tool: Tool,
-    params: Record<string, unknown>,
-    context: ToolContext
+    toolName: string,
+    input: any,
+    context: ToolContext,
+    options?: ToolExecuteOptions
   ): Promise<ToolResult> {
-    // 参数验证
-    if (tool.parameters) {
-      const validation = ParameterValidator.validate(params, tool.parameters);
-      if (!validation.valid) {
-        return {
-          success: false,
-          error: validation.error || '参数验证失败',
-          response: `❌ 参数错误: ${validation.error}`,
-        };
+    const startTime = Date.now();
+    console.log(`[ToolRegistry] 执行工具：${toolName}`, input);
+
+    // 1. 检查工具是否存在
+    const tool = this.get(toolName);
+    if (!tool) {
+      const error = `工具不存在：${toolName}`;
+      console.error(`[ToolRegistry] ${error}`);
+      return { success: false, error };
+    }
+
+    // 2. 检查工具是否启用
+    if (tool.enabled === false) {
+      const error = `工具未启用：${toolName}`;
+      console.error(`[ToolRegistry] ${error}`);
+      return { success: false, error };
+    }
+
+    // 3. 权限检查（预留）
+    if (!options?.skipPermissionCheck) {
+      const permissionResult = await this.checkPermission(tool, context);
+      if (!permissionResult.allowed) {
+        return { success: false, error: permissionResult.reason };
       }
     }
 
-    // 执行工具
+    // 4. 限流检查
+    if (!options?.skipRateLimit && this.config.enableRateLimit) {
+      const rateLimitResult = this.checkRateLimit(toolName);
+      if (!rateLimitResult.allowed) {
+        return { success: false, error: '触发限流，请稍后重试' };
+      }
+      // 检查通过后立即记录时间戳（预分配），防止并发请求超过限制
+      this.recordRateLimit(toolName);
+    }
+
+    // 5. 执行工具
+    const timeout = options?.timeout || tool.timeout || this.config.defaultTimeout;
+    const timeoutPromise = new Promise<ToolResult>((_, reject) =>
+      setTimeout(() => reject(new Error(`工具执行超时：${timeout}ms`)), timeout)
+    );
+
+    const executionPromise = (async () => {
+      try {
+        const result = await tool.handler(input, context);
+
+        // 记录执行日志
+        if (this.config.enableLogging) {
+          this.logExecution(toolName, input, result, Date.now() - startTime, context);
+        }
+
+        return result;
+      } catch (error: any) {
+        console.error(`[ToolRegistry] 工具执行失败：${toolName}`, error);
+        return {
+          success: false,
+          error: error.message || '工具执行失败',
+        };
+      }
+    })();
+
     try {
-      return await tool.handler(params, context);
-    } catch (error) {
-      console.error(`[ToolExecutor] Error executing tool "${tool.name}":`, error);
+      return await Promise.race([executionPromise, timeoutPromise]);
+    } catch (error: any) {
+      console.error(`[ToolRegistry] 工具执行异常：${toolName}`, error);
       return {
         success: false,
-        error: error instanceof Error ? error.message : String(error),
-        response: `❌ 执行失败: ${error instanceof Error ? error.message : String(error)}`,
+        error: error.message || '工具执行异常',
       };
     }
+  }
+
+  // ============================================================================
+  // 权限检查（预留实现）
+  // ============================================================================
+
+  private async checkPermission(
+    tool: Tool,
+    context: ToolContext
+  ): Promise<{ allowed: boolean; reason?: string }> {
+    // TODO: 实现权限检查逻辑
+    // 目前默认允许所有操作
+    return { allowed: true };
+  }
+
+  // ============================================================================
+  // 限流逻辑
+  // ============================================================================
+
+  private checkRateLimit(toolName: string): { allowed: boolean } {
+    const now = Date.now();
+    const windowMs = 60 * 1000; // 1 分钟
+    const maxRequests = this.config.rateLimitPerMinute;
+
+    const timestamps = this.rateLimitMap.get(toolName) || [];
+    const recentTimestamps = timestamps.filter(ts => now - ts < windowMs);
+
+    if (recentTimestamps.length >= maxRequests) {
+      return { allowed: false };
+    }
+
+    return { allowed: true };
+  }
+
+  private recordRateLimit(toolName: string): void {
+    const timestamps = this.rateLimitMap.get(toolName) || [];
+    timestamps.push(Date.now());
+    this.rateLimitMap.set(toolName, timestamps);
+  }
+
+  // ============================================================================
+  // 日志记录
+  // ============================================================================
+
+  private logExecution(
+    toolName: string,
+    input: any,
+    result: ToolResult,
+    duration: number,
+    context: ToolContext
+  ): void {
+    const log: ToolExecutionLog = {
+      toolName,
+      input,
+      result,
+      duration,
+      timestamp: Date.now(),
+      context: {
+        userId: context.userId,
+        chatId: context.chatId,
+      },
+    };
+
+    this.executionHistory.push(log);
+
+    // 保留最近 1000 条记录
+    if (this.executionHistory.length > 1000) {
+      this.executionHistory.shift();
+    }
+
+    console.log(
+      `[ToolRegistry] 执行完成：${toolName} (${duration}ms) - ${result.success ? '成功' : '失败'}`
+    );
   }
 
   /**
-   * 通过名称执行工具
+   * 获取执行历史
    */
-  async executeByName(
-    name: string,
-    params: Record<string, unknown>,
-    context: ToolContext,
-    registry: ToolRegistry
-  ): Promise<ToolResult> {
-    const tool = registry.get(name);
-    if (!tool) {
-      return {
-        success: false,
-        error: `Tool not found: ${name}`,
-        response: `❌ 未知工具: ${name}`,
+  getExecutionHistory(limit: number = 100): ToolExecutionLog[] {
+    return this.executionHistory.slice(-limit);
+  }
+
+  /**
+   * 清除执行历史
+   */
+  clearExecutionHistory(): void {
+    this.executionHistory = [];
+  }
+
+  // ============================================================================
+  // 转换为 Anthropic Function Schema
+  // ============================================================================
+
+  /**
+   * 将工具转换为 Anthropic Function Schema 格式
+   */
+  toAnthropicSchema(tool: Tool): AnthropicToolSchema {
+    const properties: Record<string, any> = {};
+    const required: string[] = [];
+
+    for (const [key, param] of Object.entries(tool.parameters.properties)) {
+      properties[key] = {
+        type: param.type,
+        description: param.description,
       };
+
+      if (param.enum) {
+        properties[key].enum = param.enum;
+      }
+
+      if (param.properties) {
+        // 嵌套对象
+        properties[key].properties = {};
+        for (const [nestedKey, nestedParam] of Object.entries(param.properties)) {
+          properties[key].properties[nestedKey] = {
+            type: nestedParam.type,
+            description: nestedParam.description,
+          };
+        }
+      }
+
+      if (param.required) {
+        required.push(key);
+      }
     }
-    return this.execute(tool, params, context);
+
+    return {
+      name: tool.name,
+      description: tool.description,
+      input_schema: {
+        type: 'object',
+        properties,
+        required: tool.parameters.required || required,
+      },
+    };
+  }
+
+  /**
+   * 将所有工具转换为 Anthropic Function Schema 格式
+   */
+  toAnthropicSchemas(): AnthropicToolSchema[] {
+    return this.getAllEnabled().map(tool => this.toAnthropicSchema(tool));
+  }
+
+  // ============================================================================
+  // 工具统计
+  // ============================================================================
+
+  /**
+   * 获取工具统计信息
+   */
+  getStats(): {
+    totalTools: number;
+    enabledTools: number;
+    totalExecutions: number;
+    successRate: number;
+    averageDuration: number;
+  } {
+    const totalTools = this.tools.size;
+    const enabledTools = this.getAllEnabled().length;
+    const totalExecutions = this.executionHistory.length;
+
+    const successfulExecutions = this.executionHistory.filter(
+      log => log.result.success
+    ).length;
+
+    const successRate = totalExecutions > 0
+      ? (successfulExecutions / totalExecutions) * 100
+      : 0;
+
+    const averageDuration = totalExecutions > 0
+      ? this.executionHistory.reduce((sum, log) => sum + log.duration, 0) / totalExecutions
+      : 0;
+
+    return {
+      totalTools,
+      enabledTools,
+      totalExecutions,
+      successRate,
+      averageDuration,
+    };
+  }
+
+  /**
+   * 重置限流计数器
+   */
+  resetRateLimits(): void {
+    this.rateLimitMap.clear();
   }
 }
 
+// ============================================================================
 // 单例
+// ============================================================================
+
 let registryInstance: ToolRegistry | null = null;
-let executorInstance: ToolExecutor | null = null;
 
 export function getToolRegistry(): ToolRegistry {
   if (!registryInstance) {
     registryInstance = new ToolRegistry();
-    registryInstance.registerAll(createBuiltinTools());
+
+    // 自动注册 CXO 工具
+    import('./cxoTools.js').then(({ registerCXOTools }) => {
+      registerCXOTools(registryInstance);
+      console.log('[ToolRegistry] ✅ CXO 工具已自动注册');
+    }).catch((error) => {
+      console.error('[ToolRegistry] ❌ CXO 工具注册失败:', error.message);
+    });
+
+    // 自动加载内置工具（HTTP、文件、任务等）
+    import('./builtin/index.js').then(({ initAllBuiltInTools }) => {
+      initAllBuiltInTools(registryInstance!);
+    }).catch((error) => {
+      console.error('[ToolRegistry] ❌ 内置工具加载失败:', error.message);
+    });
   }
   return registryInstance;
 }
 
-export function getToolExecutor(): ToolExecutor {
-  if (!executorInstance) {
-    executorInstance = new ToolExecutor();
-  }
-  return executorInstance;
-}
-
-/**
- * 内置工具定义
- */
-function createBuiltinTools(): Tool[] {
-  // Goal tools
-  const createGoal: Tool = {
-    name: 'create_goal',
-    description: 'Create a new goal. Use when user wants to achieve something, create objectives, or set targets.',
-    category: ToolCategory.GOAL,
-    parameters: {
-      title: { type: 'string', description: 'Goal title', required: true },
-      type: { type: 'string', description: 'Goal type: long_term or short_term', required: true, enum: ['long_term', 'short_term'] },
-      description: { type: 'string', description: 'Detailed description of the goal', required: false },
-    },
-    handler: async (params, ctx) => {
-      const manager = getGoalManager();
-      const goal = await manager.createGoal({
-        type: params.type as 'long_term' | 'short_term',
-        title: String(params.title),
-        description: params.description ? String(params.description) : undefined,
-      });
-      return {
-        success: true,
-        data: goal,
-        response: `✅ 目标创建成功\n\n📋 ${goal.title}\n🆔 ${goal.id}`,
-      };
-    },
-  };
-
-  const listGoals: Tool = {
-    name: 'list_goals',
-    description: 'List all goals with their status',
-    category: ToolCategory.GOAL,
-    handler: async (_, ctx) => {
-      const manager = getGoalManager();
-      const goals = manager.listGoals();
-      if (goals.length === 0) {
-        return { success: true, response: '📋 暂无目标', data: [] };
-      }
-      const lines = goals.map(g => {
-        const icon = g.status === 'completed' ? '✅' : g.status === 'active' ? '🚀' : '📋';
-        return `${icon} ${g.title}`;
-      });
-      return {
-        success: true,
-        response: `📋 目标列表 (${goals.length}个)\n\n${lines.join('\n')}`,
-        data: goals,
-      };
-    },
-  };
-
-  const getGoalProgress: Tool = {
-    name: 'get_goal_progress',
-    description: 'Get progress details for a specific goal',
-    category: ToolCategory.GOAL,
-    parameters: {
-      goalId: { type: 'string', description: 'The goal ID to check progress for', required: false },
-    },
-    handler: async (params, ctx) => {
-      const manager = getGoalManager();
-      const goalId = params.goalId as string | undefined;
-      if (!goalId) {
-        // 没有提供 goalId，返回最新目标的进度
-        const goals = manager.listGoals();
-        if (goals.length === 0) {
-          return { success: true, response: '📋 暂无目标', data: null };
-        }
-        const latestGoal = goals[0];
-        const progress = manager.getProgress(latestGoal.id);
-        return {
-          success: true,
-          data: progress,
-          response: `📊 ${progress.goal.title} (最新目标)\n\n状态: ${progress.status}`,
-        };
-      }
-      const progress = manager.getProgress(goalId);
-      return {
-        success: true,
-        data: progress,
-        response: `📊 ${progress.goal.title}\n\n状态: ${progress.status}`,
-      };
-    },
-  };
-
-  // Employee tools
-  const listEmployees: Tool = {
-    name: 'list_employees',
-    description: 'List all active employees',
-    category: ToolCategory.EMPLOYEE,
-    handler: async (_, ctx) => {
-      const db = ctx.db as AIDatabase;
-      const employees = db.listEmployees({ status: 'active' });
-      if (employees.length === 0) {
-        return { success: true, response: '👥 暂无员工', data: [] };
-      }
-      const lines = employees.map((e: unknown) => {
-        const emp = e as { name: string; role: string };
-        return `👤 ${emp.name} (${emp.role})`;
-      });
-      return {
-        success: true,
-        response: `👥 员工列表 (${employees.length}人)\n\n${lines.join('\n')}`,
-        data: employees,
-      };
-    },
-  };
-
-  const getLeaderboard: Tool = {
-    name: 'get_leaderboard',
-    description: 'Get employee performance leaderboard ranked by points',
-    category: ToolCategory.EMPLOYEE,
-    handler: async (_, ctx) => {
-      const service = getEmployeeService();
-      const leaderboard = service.getLeaderboard();
-      if (leaderboard.length === 0) {
-        return { success: true, response: '🏆 暂无排行数据', data: [] };
-      }
-      const lines = leaderboard.map((e, i) => {
-        const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
-        return `${medal} ${e.name} - ${e.points}分 (Lv.${e.level})`;
-      });
-      return {
-        success: true,
-        response: `🏆 员工排行榜\n\n${lines.join('\n')}`,
-        data: leaderboard,
-      };
-    },
-  };
-
-  // Cron tools
-  const createScheduledTask: Tool = {
-    name: 'create_scheduled_task',
-    description: 'Create a new scheduled/cron task',
-    category: ToolCategory.CRON,
-    parameters: {
-      name: { type: 'string', description: 'Task name', required: true },
-      cronRule: { type: 'string', description: 'Cron expression (e.g., 0 9 * * *)', required: true },
-      command: { type: 'string', description: 'Command to execute', required: true },
-    },
-    handler: async (params, ctx) => {
-      const db = ctx.db as AIDatabase;
-      const cron = {
-        id: `cron_${Date.now()}`,
-        name: String(params.name),
-        cronRule: String(params.cronRule),
-        command: String(params.command),
-      };
-      db.createCron(cron);
-      return {
-        success: true,
-        data: cron,
-        response: `⏰ 定时任务创建成功\n\n📋 ${cron.name}\n⏰ ${cron.cronRule}\n🆔 ${cron.id}`,
-      };
-    },
-  };
-
-  const listScheduledTasks: Tool = {
-    name: 'list_scheduled_tasks',
-    description: 'List all scheduled/cron tasks',
-    category: ToolCategory.CRON,
-    handler: async (_, ctx) => {
-      const db = ctx.db as AIDatabase;
-      const jobs = db.listCrons({});
-      if (jobs.length === 0) {
-        return { success: true, response: '⏰ 暂无定时任务', data: [] };
-      }
-      const lines = jobs.map((j: unknown) => {
-        const job = j as { name: string; enabled: boolean; cron_rule: string };
-        return `${job.enabled ? '✅' : '❌'} ${job.name}: ${job.cron_rule}`;
-      });
-      return {
-        success: true,
-        response: `⏰ 定时任务列表 (${jobs.length}个)\n\n${lines.join('\n')}`,
-        data: jobs,
-      };
-    },
-  };
-
-  // Query tools
-  const querySystemStatus: Tool = {
-    name: 'query_system_status',
-    description: 'Get overall system status including goals, employees, and tasks',
-    category: ToolCategory.QUERY,
-    handler: async (_, ctx) => {
-      const db = ctx.db as AIDatabase;
-      const [goals, employees, cronJobs] = [
-        getGoalManager().listGoals(),
-        db.listEmployees({ status: 'active' }),
-        db.listCrons({}),
-      ];
-      return {
-        success: true,
-        data: { goals, employees, cronJobs },
-        response: `📊 AI Company 系统状态\n\n🎯 目标: ${goals.length}\n👥 员工: ${employees.length}\n⏰ 定时任务: ${cronJobs.length}`,
-      };
-    },
-  };
-
-  // Chat tool
-  const chat: Tool = {
-    name: 'chat',
-    description: 'General conversational response when no other tool applies',
-    category: ToolCategory.CHAT,
-    handler: async (params, ctx) => {
-      return {
-        success: true,
-        response: '你好！我是 AI Company CEO。有什么可以帮你？\n\n你可以:\n- 创建目标 (说 "创建一个目标")\n- 查看状态 (说 "系统状态")\n- 查看员工 (说 "员工列表")\n- 创建应用 (说 "创建一个计算器应用")',
-      };
-    },
-  };
-
-  // Open task tool
-  const executeOpenTask: Tool = {
-    name: 'execute_open_task',
-    description: 'Execute an open-ended task like creating an application, website, or tool. Use when user wants to build something specific.',
-    category: ToolCategory.SYSTEM,
-    parameters: {
-      description: { type: 'string', description: 'Task description', required: true },
-    },
-    handler: async (params, ctx) => {
-      // This is handled by the Orchestrator's open_task flow
-      return {
-        success: true,
-        response: `正在执行任务：${params.description}\n\n系统将自动分析需求、生成计划并执行。`,
-      };
-    },
-  };
-
-  return [
-    createGoal,
-    listGoals,
-    getGoalProgress,
-    listEmployees,
-    getLeaderboard,
-    createScheduledTask,
-    listScheduledTasks,
-    querySystemStatus,
-    chat,
-    executeOpenTask,
-  ];
+export function resetToolRegistry(): void {
+  registryInstance = null;
 }

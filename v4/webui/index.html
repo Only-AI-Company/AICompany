@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Company v4 - DeepAgent Visualization</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    .container {
+      display: grid;
+      grid-template-columns: 280px 1fr 350px;
+      grid-template-rows: 60px 1fr 200px;
+      gap: 1px;
+      background: #1e293b;
+      height: 100vh;
+    }
+
+    /* Header */
+    .header {
+      grid-column: 1 / -1;
+      background: #1e293b;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      border-bottom: 1px solid #334155;
+    }
+
+    .header h1 {
+      font-size: 20px;
+      background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: 20px;
+      font-size: 13px;
+      color: #10b981;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    /* Sidebar - Agent Tree */
+    .sidebar {
+      background: #1e293b;
+      border-right: 1px solid #334155;
+      padding: 16px;
+      overflow-y: auto;
+    }
+
+    .sidebar h3 {
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #64748b;
+      margin-bottom: 12px;
+      letter-spacing: 0.5px;
+    }
+
+    .agent-tree {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .agent-node {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      background: #334155;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+      border-left: 3px solid transparent;
+    }
+
+    .agent-node:hover {
+      background: #475569;
+    }
+
+    .agent-node.active {
+      border-left-color: #3b82f6;
+      background: #1e3a5f;
+    }
+
+    .agent-icon {
+      font-size: 20px;
+    }
+
+    .agent-info {
+      flex: 1;
+    }
+
+    .agent-name {
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .agent-status {
+      font-size: 11px;
+      color: #94a3b8;
+    }
+
+    .agent-children {
+      margin-left: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    /* Main - Execution Trace */
+    .main {
+      background: #0f172a;
+      padding: 20px;
+      overflow-y: auto;
+    }
+
+    .trace-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .trace-title {
+      font-size: 14px;
+      color: #94a3b8;
+    }
+
+    .trace-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .trace-item {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 16px;
+      animation: slideIn 0.3s ease;
+    }
+
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateX(-10px); }
+      to { opacity: 1; transform: translateX(0); }
+    }
+
+    .trace-item.pending {
+      border-left: 3px solid #f59e0b;
+    }
+
+    .trace-item.running {
+      border-left: 3px solid #3b82f6;
+      background: #1e3a5f;
+    }
+
+    .trace-item.completed {
+      border-left: 3px solid #10b981;
+    }
+
+    .trace-item.error {
+      border-left: 3px solid #ef4444;
+    }
+
+    .trace-header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .trace-agent {
+      font-size: 13px;
+      font-weight: 600;
+      color: #3b82f6;
+    }
+
+    .trace-status {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+
+    .trace-status.pending { background: #78350f; color: #fbbf24; }
+    .trace-status.running { background: #1e3a8a; color: #60a5fa; }
+    .trace-status.completed { background: #064e3b; color: #34d399; }
+
+    .trace-step {
+      font-size: 12px;
+      color: #e2e8f0;
+      margin-bottom: 4px;
+    }
+
+    .trace-time {
+      font-size: 11px;
+      color: #64748b;
+    }
+
+    .trace-thinking {
+      background: #0f172a;
+      border-radius: 6px;
+      padding: 10px;
+      margin-top: 8px;
+      font-size: 12px;
+      color: #94a3b8;
+      font-style: italic;
+    }
+
+    /* Right Panel - Task & Thought */
+    .right-panel {
+      background: #1e293b;
+      border-left: 1px solid #334155;
+      padding: 16px;
+      overflow-y: auto;
+    }
+
+    .panel-section {
+      margin-bottom: 24px;
+    }
+
+    .panel-section h3 {
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #64748b;
+      margin-bottom: 12px;
+      letter-spacing: 0.5px;
+    }
+
+    .task-card {
+      background: #334155;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+
+    .task-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .task-meta {
+      display: flex;
+      gap: 12px;
+      font-size: 11px;
+      color: #94a3b8;
+    }
+
+    .progress-bar {
+      height: 6px;
+      background: #1e293b;
+      border-radius: 3px;
+      overflow: hidden;
+      margin-top: 12px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+      transition: width 0.3s;
+      border-radius: 3px;
+    }
+
+    .thought-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .thought-item {
+      background: #334155;
+      border-radius: 6px;
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .thought-label {
+      color: #94a3b8;
+      font-size: 10px;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+    }
+
+    /* Bottom - Chat */
+    .chat-section {
+      grid-column: 1 / -1;
+      background: #1e293b;
+      border-top: 1px solid #334155;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .chat-messages {
+      flex: 1;
+      padding: 12px 24px;
+      overflow-y: auto;
+      max-height: 120px;
+    }
+
+    .message {
+      display: inline-block;
+      max-width: 70%;
+      padding: 8px 14px;
+      border-radius: 12px;
+      margin: 4px 0;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .message.user {
+      background: #3b82f6;
+      color: #fff;
+      margin-left: auto;
+    }
+
+    .message.assistant {
+      background: #334155;
+    }
+
+    .chat-input {
+      display: flex;
+      gap: 12px;
+      padding: 12px 24px;
+      border-top: 1px solid #334155;
+    }
+
+    .chat-input input {
+      flex: 1;
+      padding: 10px 16px;
+      background: #334155;
+      border: 1px solid #475569;
+      border-radius: 8px;
+      color: #e2e8f0;
+      font-size: 13px;
+      outline: none;
+    }
+
+    .chat-input input:focus {
+      border-color: #3b82f6;
+    }
+
+    .chat-input button {
+      padding: 10px 20px;
+      background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s;
+    }
+
+    .chat-input button:hover {
+      transform: translateY(-2px);
+    }
+
+    .quick-actions {
+      display: flex;
+      gap: 8px;
+      padding: 8px 24px;
+      background: #0f172a;
+    }
+
+    .quick-actions button {
+      padding: 4px 12px;
+      background: #334155;
+      border: 1px solid #475569;
+      border-radius: 12px;
+      color: #94a3b8;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .quick-actions button:hover {
+      background: #3b82f6;
+      border-color: #3b82f6;
+      color: #fff;
+    }
+
+    /* Empty State */
+    .empty-state {
+      text-align: center;
+      padding: 40px 20px;
+      color: #64748b;
+    }
+
+    .empty-icon {
+      font-size: 48px;
+      margin-bottom: 12px;
+    }
+
+    .empty-text {
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <h1>🤖 AI Company v4 - DeepAgent Visualization</h1>
+      <div class="status-badge">
+        <div class="status-dot"></div>
+        <span id="statusText">Connected</span>
+      </div>
+    </div>
+
+    <!-- Sidebar - Agent Tree -->
+    <div class="sidebar">
+      <h3>Agent Hierarchy</h3>
+      <div class="agent-tree" id="agentTree">
+        <div class="agent-node active" data-agent="ceo">
+          <div class="agent-icon">🎯</div>
+          <div class="agent-info">
+            <div class="agent-name">CEO Agent</div>
+            <div class="agent-status">Decision Making</div>
+          </div>
+        </div>
+        <div class="agent-children">
+          <div class="agent-node" data-agent="manager">
+            <div class="agent-icon">📋</div>
+            <div class="agent-info">
+              <div class="agent-name">Manager Agent</div>
+              <div class="agent-status">Coordination</div>
+            </div>
+          </div>
+          <div class="agent-children">
+            <div class="agent-node" data-agent="researcher">
+              <div class="agent-icon">🔍</div>
+              <div class="agent-info">
+                <div class="agent-name">Researcher</div>
+                <div class="agent-status">Idle</div>
+              </div>
+            </div>
+            <div class="agent-node" data-agent="creator">
+              <div class="agent-icon">✍️</div>
+              <div class="agent-info">
+                <div class="agent-name">Creator</div>
+                <div class="agent-status">Idle</div>
+              </div>
+            </div>
+            <div class="agent-node" data-agent="publisher">
+              <div class="agent-icon">📤</div>
+              <div class="agent-info">
+                <div class="agent-name">Publisher</div>
+                <div class="agent-status">Idle</div>
+              </div>
+            </div>
+            <div class="agent-node" data-agent="analyst">
+              <div class="agent-icon">📊</div>
+              <div class="agent-info">
+                <div class="agent-name">Analyst</div>
+                <div class="agent-status">Idle</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main - Execution Trace -->
+    <div class="main">
+      <div class="trace-header">
+        <div class="trace-title">Execution Trace</div>
+        <div style="display: flex; gap: 12px; align-items: center;">
+          <button id="toggleLangfuseBtn" onclick="toggleLangfuseTraces()" style="padding: 6px 12px; background: #334155; border: 1px solid #475569; border-radius: 6px; color: #94a3b8; cursor: pointer; font-size: 12px;">
+            📊 View LangFuse Traces
+          </button>
+          <div class="trace-title" id="currentTask">No active task</div>
+        </div>
+      </div>
+      <div class="trace-list" id="traceList">
+        <div class="empty-state">
+          <div class="empty-icon">🚀</div>
+          <div class="empty-text">Send a message to see the execution trace</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Panel - Task & Thought -->
+    <div class="right-panel">
+      <div class="panel-section">
+        <h3>Current Task</h3>
+        <div class="task-card">
+          <div class="task-title" id="taskTitle">No active task</div>
+          <div class="task-meta">
+            <span id="taskType">-</span>
+            <span id="taskPriority">-</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel-section">
+        <h3>Thought Process</h3>
+        <div class="thought-list" id="thoughtList">
+          <div class="empty-state">
+            <div class="empty-icon">💭</div>
+            <div class="empty-text">Agent thoughts will appear here</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom - Chat -->
+    <div class="chat-section">
+      <div class="quick-actions">
+        <button onclick="quickAction('搜集马斯克最新消息')">📰 新闻搜索</button>
+        <button onclick="quickAction('写一篇小红书笔记')">📝 创作笔记</button>
+        <button onclick="quickAction('分析我的数据')">📊 数据分析</button>
+        <button onclick="quickAction('创建一个任务')">➕ 新建任务</button>
+      </div>
+      <div class="chat-messages" id="chatMessages">
+        <div class="message assistant">欢迎使用 AI Company v4！我可以帮你完成任务、创作内容、分析数据等。</div>
+      </div>
+      <div class="chat-input">
+        <input type="text" id="messageInput" placeholder="输入你的需求..." />
+        <button onclick="sendMessage()">发送</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const WS_URL = 'ws://localhost:8081';
+    const API_URL = 'http://localhost:3000/api';
+    const LANGFUSE_URL = 'http://localhost:3001';
+    let ws = null;
+    let traceCounter = 0;
+    let showLangFuseTraces = false;
+
+    // Initialize WebSocket
+    function connect() {
+      ws = new WebSocket(`${WS_URL}?userId=web-${Date.now()}&source=web`);
+
+      ws.onopen = () => {
+        document.getElementById('statusText').textContent = 'Connected';
+        document.querySelector('.status-dot').style.background = '#10b981';
+      };
+
+      ws.onclose = () => {
+        document.getElementById('statusText').textContent = 'Disconnected';
+        document.querySelector('.status-dot').style.background = '#ef4444';
+        setTimeout(connect, 3000);
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        handleWebSocketMessage(data);
+      };
+    }
+
+    // Handle WebSocket messages
+    function handleWebSocketMessage(data) {
+      console.log('Received:', data);
+
+      if (data.type === 'chat_response' && data.payload?.content) {
+        addChatMessage(data.payload.content, 'assistant');
+        simulateTrace(data.payload.content);
+      }
+    }
+
+    // Add chat message
+    function addChatMessage(content, type) {
+      const messagesEl = document.getElementById('chatMessages');
+      const msgEl = document.createElement('div');
+      msgEl.className = `message ${type}`;
+      msgEl.textContent = content;
+      messagesEl.appendChild(msgEl);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    // Simulate execution trace
+    function simulateTrace(task) {
+      const traceList = document.getElementById('traceList');
+      traceList.innerHTML = '';
+
+      const steps = [
+        { agent: 'CEO', step: 'Analyzing task requirements...', status: 'completed' },
+        { agent: 'CEO', step: 'Evaluating risk level: LOW', status: 'completed' },
+        { agent: 'Manager', step: 'Decomposing task into subtasks', status: 'completed' },
+        { agent: 'Manager', step: 'Assigning to Researcher Agent', status: 'completed' },
+        { agent: 'Researcher', step: 'Searching for information...', status: 'running' },
+      ];
+
+      steps.forEach((step, index) => {
+        setTimeout(() => {
+          addTraceItem(step);
+          updateTaskProgress((index + 1) / steps.length * 100);
+        }, index * 500);
+      });
+
+      // Update task info
+      document.getElementById('taskTitle').textContent = task.substring(0, 50) + '...';
+      document.getElementById('taskType').textContent = 'task';
+      document.getElementById('taskPriority').textContent = 'medium';
+    }
+
+    // Add trace item
+    function addTraceItem(step) {
+      const traceList = document.getElementById('traceList');
+      const traceEl = document.createElement('div');
+      traceEl.className = `trace-item ${step.status}`;
+      traceEl.innerHTML = `
+        <div class="trace-header-row">
+          <div class="trace-agent">${step.agent}</div>
+          <div class="trace-status ${step.status}">${step.status}</div>
+        </div>
+        <div class="trace-step">${step.step}</div>
+        <div class="trace-time">${new Date().toLocaleTimeString()}</div>
+      `;
+      traceList.insertBefore(traceEl, traceList.firstChild);
+
+      // Add thought
+      if (step.status === 'running') {
+        addThought(step.agent, step.step);
+      }
+    }
+
+    // Update task progress
+    function updateTaskProgress(percent) {
+      document.getElementById('progressFill').style.width = `${percent}%`;
+    }
+
+    // Add thought
+    function addThought(agent, thought) {
+      const thoughtList = document.getElementById('thoughtList');
+      const emptyState = thoughtList.querySelector('.empty-state');
+      if (emptyState) emptyState.remove();
+
+      const thoughtEl = document.createElement('div');
+      thoughtEl.className = 'thought-item';
+      thoughtEl.innerHTML = `
+        <div class="thought-label">${agent} thinking</div>
+        <div>${thought}</div>
+      `;
+      thoughtList.insertBefore(thoughtEl, thoughtList.firstChild);
+    }
+
+    // Send message
+    async function sendMessage() {
+      const input = document.getElementById('messageInput');
+      const content = input.value.trim();
+      if (!content) return;
+
+      addChatMessage(content, 'user');
+      input.value = '';
+
+      // Send via WebSocket
+      ws.send(JSON.stringify({
+        type: 'chat_message',
+        payload: {
+          conversationId: 'conv-main',
+          content: content
+        }
+      }));
+
+      // Send via API
+      try {
+        const response = await fetch(`${API_URL}/conversations/conv-main/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content })
+        });
+        const data = await response.json();
+        if (data.success && data.data?.response) {
+          addChatMessage(data.data.response, 'assistant');
+        }
+      } catch (error) {
+        console.error('API error:', error);
+      }
+    }
+
+    // Quick action
+    function quickAction(text) {
+      document.getElementById('messageInput').value = text;
+      sendMessage();
+    }
+
+    // Event listeners
+    document.getElementById('messageInput').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') sendMessage();
+    });
+
+    // Agent node click
+    document.querySelectorAll('.agent-node').forEach(node => {
+      node.addEventListener('click', () => {
+        document.querySelectorAll('.agent-node').forEach(n => n.classList.remove('active'));
+        node.classList.add('active');
+      });
+    });
+
+    // Initialize
+    connect();
+
+    // Toggle LangFuse traces
+    async function toggleLangfuseTraces() {
+      showLangFuseTraces = !showLangFuseTraces;
+      const btn = document.getElementById('toggleLangfuseBtn');
+
+      if (showLangFuseTraces) {
+        btn.textContent = '🔄 Show Live Traces';
+        btn.style.background = '#1e3a5f';
+        btn.style.borderColor = '#3b82f6';
+        await loadLangfuseTraces();
+      } else {
+        btn.textContent = '📊 View LangFuse Traces';
+        btn.style.background = '#334155';
+        btn.style.borderColor = '#475569';
+      }
+    }
+
+    // Load traces from LangFuse
+    async function loadLangfuseTraces() {
+      if (!showLangFuseTraces) return;
+
+      try {
+        const response = await fetch(`${LANGFUSE_URL}/api/public/traces?limit=20`);
+        if (!response.ok) throw new Error('Failed to fetch traces');
+
+        const data = await response.json();
+        const traceList = document.getElementById('traceList');
+        traceList.innerHTML = '';
+
+        if (!data.data || data.data.length === 0) {
+          traceList.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-icon">📊</div>
+              <div class="empty-text">No traces found in LangFuse</div>
+            </div>
+          `;
+          return;
+        }
+
+        data.data.forEach(trace => {
+          const traceEl = document.createElement('div');
+          traceEl.className = 'trace-item completed';
+          traceEl.innerHTML = `
+            <div class="trace-header-row">
+              <div class="trace-agent">${trace.name || 'Unknown'}</div>
+              <div class="trace-time">${new Date(trace.timestamp).toLocaleString()}</div>
+            </div>
+            <div class="trace-step">Session: ${trace.sessionId || 'N/A'}</div>
+            <div class="trace-step">Metadata: ${JSON.stringify(trace.metadata || {}).substring(0, 100)}</div>
+          `;
+          traceList.appendChild(traceEl);
+        });
+      } catch (error) {
+        console.error('Error loading LangFuse traces:', error);
+        const traceList = document.getElementById('traceList');
+        traceList.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">⚠️</div>
+            <div class="empty-text">Failed to load LangFuse traces. Make sure LangFuse is running on ${LANGFUSE_URL}</div>
+          </div>
+        `;
+      }
+    }
+  </script>
+</body>
+</html>
